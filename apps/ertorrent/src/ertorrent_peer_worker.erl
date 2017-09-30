@@ -13,7 +13,7 @@
 -export([reset_rx_keep_alive/1,
          reset_tx_keep_alive/1,
          send_keep_alive/1,
-         start_transmit/1]).
+         activate/1]).
 
 -export([start/5,
          start_link/5,
@@ -85,8 +85,10 @@
 -define(PEER_PROTOCOL, ertorrent_peer_tcp_protocol).
 
 %%% Extended client API
-start_transmit(ID) ->
-    gen_server:cast(ID, transmit).
+
+% Instructing the peer worker to start leeching
+activate(ID) ->
+    gen_server:cast(ID, peer_w_activate).
 
 %%% Standard client API
 
@@ -191,7 +193,7 @@ handle_call(_Req, _From, State) ->
     {noreply, State}.
 
 %% Asynchronous
-handle_cast({activate}, State) ->
+handle_cast(activate, State) ->
     Info_hash = State#state.torrent_info_hash,
     Peer_id = State#state.peer_id,
 
@@ -209,7 +211,10 @@ handle_cast({activate}, State) ->
                                                   self(),
                                                   {keep_alive_rx_timeout}),
 
-            {noreply, State#state{keep_alive_rx_ref=Keep_alive_rx_ref, keep_alive_tx_ref=Keep_alive_tx_ref}};
+            {noreply,
+             State#state{keep_alive_rx_ref=Keep_alive_rx_ref,
+                         keep_alive_tx_ref=Keep_alive_tx_ref},
+             hibernate};
         {error, Reason} ->
             {stop, {error_handshake, Reason}}
     end;

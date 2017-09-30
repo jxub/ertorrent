@@ -6,7 +6,7 @@
          list_to_bitfield/1,
          set_bit/3,
          sum_bitfields/1,
-         parse_peers/1]).
+         parse_peers4/1]).
 
 % Reversing the binary order as reversing a list
 bin_reverse(Bin) when is_binary(Bin) ->
@@ -43,16 +43,21 @@ list_to_bitfield(List) when is_list(List) ->
     {ok, Bitfield}.
 
 % Parsing the binary representation of the peers-section from a tracker response
-parse_peers(Peers) when is_binary(Peers) ->
-    Peers_list = parse_peers1(Peers, []),
+parse_peers4(Peers) when is_binary(Peers) ->
+    Peers_list = parse_peers4(Peers, []),
     {ok, Peers_list}.
 
-parse_peers1(<<>>, Acc) ->
+parse_peers4(<<>>, Acc) ->
     Acc;
-parse_peers1(<<Address_int:4/integer, Port:2/integer, Rest/binary>>, Acc) ->
-    % Format address from string to ip_address(), a tuple based quad format
-    {ok, Address} = inet:parse_ipv4_address(Address_int),
-    parse_peers1(Rest, [{Address, Port}| Acc]).
+parse_peers4(<<A:8/big-integer,
+               B:8/big-integer,
+               C:8/big-integer,
+               D:8/big-integer,
+               Port:16/big-integer, Rest/binary>>, Acc) ->
+    Address = {A, B, C, D},
+    parse_peers4(Rest, [{Address, Port}| Acc]);
+parse_peers4(Unmatched, _Acc) ->
+    lager:warning("unmatched '~p'", [Unmatched]).
 
 %% Set bit at index
 set_bit(Index, Value, Bitfield) ->

@@ -5,6 +5,7 @@
          read_term_from_file/1,
          write_term_to_file/2,
          encode_hash/1,
+         percent_encode/1,
          pieces_binary_to_list/1]).
 
 -ifdef(EUNIT).
@@ -192,11 +193,14 @@ read_term_from_file(Filename) ->
 write_term_to_file(Filename, Data) ->
     file:write_file(Filename, erlang:term_to_binary(Data)).
 
-% percent_encode([], Acc) ->
-%     lists:reverse(Acc);
-% percent_encode([Msn, Lsn|Tail], Acc) ->
-%     New_acc = [Lsn, Msn, $%|Acc],
-%     percent_encode(Tail, New_acc).
+percent_encode(Str) ->
+    percent_encode(Str, []).
+
+percent_encode([], Acc) ->
+    lists:reverse(Acc);
+percent_encode([Msn, Lsn|Tail], Acc) ->
+    New_acc = [Lsn, Msn, $%|Acc],
+    percent_encode(Tail, New_acc).
 
 encode_hash(Info_bencoded) ->
     % 160bits/8=20 byte SHA1 as integerlist

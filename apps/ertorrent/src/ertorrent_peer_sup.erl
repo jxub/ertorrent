@@ -2,10 +2,20 @@
 
 -behaviour(supervisor).
 
--export([start_link/0,
-         init/1]).
+-export([
+         start_child/4
+        ]).
+
+-export([
+         start_link/0,
+         init/1
+        ]).
 
 -define(SETTINGS, ertorrent_settings_srv).
+
+start_child(ID, Info_hash, Own_peer_id, Socket) ->
+    supervisor:start_child(?MODULE, [ID, [ID, Info_hash, Peer_id_own,
+                                          Socket]]),
 
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).

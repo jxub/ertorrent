@@ -20,7 +20,7 @@ start_link() ->
     supervisor:start_link({local, ertorrent_torrent_sup}, ?MODULE, []).
 
 init(_Arg) ->
-    SupFlags = {one_for_one, 10, 10},
+    SupFlags = {one_for_one, 1, 1},
 
     %Child_spec = #{id => ertorrent_torrent_worker,
     %               start => {ertorrent_torrent_worker, start_link, []},

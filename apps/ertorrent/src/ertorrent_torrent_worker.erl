@@ -27,7 +27,7 @@
 
 -include("ertorrent_log.hrl").
 
--define(ANNOUNCE_TIME, 30000).
+-define(ANNOUNCE_TIME, 120).
 -define(BINARY, ertorrent_binary_utils).
 -define(FILE_SRV, ertorrent_file_srv).
 -define(HASH_SRV, ertorrent_hash_srv).
@@ -81,10 +81,10 @@
                 peers::list(),
                 peer_id::string(), % Our unique peer id e.g. ER-1-0-0-<sha1>
                 peer_listen_port::integer(),
-                pieces::list(), % Piece hashes from the metainfo
-                piece_layout::list(), % A translation between piece index and file offset, e.g. [{Piece_idx, File_path, File_offset, Length}]
                 peers_max::integer(), % The maximum amount of peers this torrent is allowed to have
                 peers_cur::integer(), % Current number of active peers
+                pieces::list(), % Piece hashes from the metainfo
+                piece_layout::list(), % A translation between piece index and file offset, e.g. [{Piece_idx, File_path, File_offset, Length}]
                 state:: initializing | active | inactive,
                 start_when_ready::boolean(), % TODO use this, if the torrent should start regardless of user input. Should also be used if you want to activate the torrent whenever the torrent is shifting state from initializing to inactive.
                 stats_leechers::integer(), % Stats from the tracker that might be of interest
@@ -98,15 +98,18 @@
 % activate/deactivate is chosen so that isn't mistaken for start/1 and stop/1
 % which are common client APIs in Erlang OTP modules.
 % @end
-activate(Torrent_worker_id) ->
-    gen_server:cast(Torrent_worker_id, {activate}).
+activate(Torrent_w_id) ->
+    gen_server:cast(Torrent_w_id, {activate}).
 
 % @doc Setting a torrent worker to the state inactive. The term
 % activate/deactivate is chosen so that isn't mistaken for start/1 and stop/1
 % which are common client APIs in Erlang OTP modules.
 % @end
-deactivate(Torrent_worker_id) ->
-    gen_server:cast(Torrent_worker_id, {deactivate}).
+deactivate(Torrent_w_id) ->
+    gen_server:cast(Torrent_w_id, {deactivate}).
+
+request_peers(Torrent_w_id, Amount_of_peers) ->
+    gen_server:cast(Torrent_w_id, {torrent_w_request_peers, self(), Amount_of_peers}).
 
 % Starting server
 start_link(Info_hash_atom, [Info_hash, Metainfo, Start_when_ready]) when is_atom(Info_hash_atom) ->
@@ -130,22 +133,36 @@ stop(Name) when is_atom(Name) ->
 % @doc Timer function for when to perform tracker announcements
 % @end
 tracker_announce_loop(State) ->
-    {ok, _Request_id} = ?TRACKER:announce(State#state.announce,
-                                          State#state.info_hash,
-                                          State#state.peer_id,
-                                          State#state.peer_listen_port,
-                                          State#state.uploaded,
-                                          State#state.downloaded,
-                                          State#state.left,
-                                          atom_to_list(State#state.event),
-                                          State#state.compact),
+    % TODO make this async
+    {ok, Response} = ?TRACKER:announce2(State#state.announce,
+                                        State#state.info_hash,
+                                        State#state.peer_id,
+                                        State#state.peer_listen_port,
+                                        State#state.uploaded,
+                                        State#state.downloaded,
+                                        State#state.left,
+                                        atom_to_list(State#state.event),
+                                        State#state.compact),
 
-    % Send message to tracker.
-    Ref = erlang:send_after(?ANNOUNCE_TIME, self(), {torrent_w_tracker_announce_loop}),
+    lager:warning("~p: ref '~p'", [?FUNCTION_NAME, self()]),
+
+    case ?METAINFO:get_value(<<"interval">>, Response) of
+        {ok, Interval} ->
+            % Send message to tracker.
+            Ref = erlang:send_after(Interval*1000, self(), {torrent_w_tracker_announce_loop}),
+
+            self() ! {tracker_announce, Response};
+        {error, no_match} ->
+            lager:error("invalid tracker response (missing interval)"),
+
+            % Send message to tracker.
+            Ref = erlang:send_after(?ANNOUNCE_TIME*1000, self(), {torrent_w_tracker_announce_loop})
+    end,
 
     {ok, Ref}.
 
 start_torrent(State) ->
+    lager:warning("~p: ref '~p'", [?FUNCTION_NAME, self()]),
     % Ensure that the directory structure is alright
     lists:foreach(fun(Path) ->
                       case filelib:ensure_dir(Path) of
@@ -232,11 +249,13 @@ init([Info_hash, Metainfo, Start_when_ready]) ->
                    files = Resolved_files,
                    file_paths = File_paths,
                    info_hash = Info_hash,
-                   left = 0,
+                   left = Length,
                    length = Length,
                    metainfo = Metainfo,
                    peer_id = Peer_id_encoded,
                    peer_listen_port = Peer_listen_port,
+                   peers_cur = 0,
+                   peers_max = 10,
                    pieces = Pieces,
                    piece_layout = Piece_layout,
                    start_when_ready = Start_when_ready,
@@ -291,13 +310,15 @@ handle_info({torrent_w_tracker_announce_loop}, State) ->
 
     {noreply, New_state};
 
-% TODO finish me!
-% - parse the peers
 handle_info({tracker_announce, Response}, State) ->
+    lager:warning("~p: ref '~p'", [?FUNCTION_NAME, self()]),
+    lager:warning("state: ~p", [State]),
     % Using utility function from metainfo since operates on bdecoded
     % structures.
-    {ok, Stats_seeders} = ?METAINFO:get_value(<<"complete">>, Response),
-    {ok, Stats_leechers} = ?METAINFO:get_value(<<"incomplete">>, Response),
+    % TODO Check if this will be use full in the future otherwise remove it
+    % (incomplete and complete are not mandatory)
+    % {ok, Stats_seeders} = ?METAINFO:get_value(<<"complete">>, Response),
+    % {ok, Stats_leechers} = ?METAINFO:get_value(<<"incomplete">>, Response),
     {ok, Peers} = ?METAINFO:get_value(<<"peers">>, Response),
 
     % The peers in a tracker response can come in two forms as a dictionary or
@@ -307,7 +328,7 @@ handle_info({tracker_announce, Response}, State) ->
     % torrent protocol?
     case is_binary(Peers) of
         true ->
-            {ok, Peer_list} = ?BINARY:parse_peers(Peers);
+            {ok, Peer_list} = ?BINARY:parse_peers4(Peers);
         false ->
             F = fun({Peer_id, Address_bin, Port}, Acc) ->
                     % TODO the convertion and resolving to
@@ -345,17 +366,32 @@ handle_info({tracker_announce, Response}, State) ->
             {Peers_activate, Peers_rest} = lists:split(Missing_nbr_peers, Peer_list),
 
             % Tell the torrent_s to start the peers
-            ?PEER_SRV ! {torrent_w_add_rx_peers, Peers_activate}
+            ?PEER_SRV:add_rx_peers(State#state.info_hash, Peers_activate);
+        false ->
+            lager:warning("nothing to do here"),
+            Peers_rest = Peer_list
     end,
 
     % Assume that the maximum amount of peers has been acheived until a message
     % has been received that says otherwise.
     New_state = State#state{peers_cur = State#state.peers_max,
-                            peers = Peers_rest,
-                            stats_leechers = Stats_leechers,
-                            stats_seeders = Stats_seeders},
+                            peers = Peers_rest},
 
     {noreply, New_state};
+
+% @doc Response from the peer server after trying to establish a peer
+% connection for a receiving peer_worker. Peer might be a tuple with the peer
+% information or 'error'.
+% @end
+handle_info({peer_s_rx_peers, Peer}, State) when is_tuple(Peer) ->
+    {noreply, State, hibernate};
+% @doc Response from the peer server after trying to establish multiple peer
+% connections for multiple receiving peer workers. The response should not
+% contain any 'error', however it might be an empty list if all the peer
+% workers failed to connect to its peer.
+% @end
+handle_info({peer_s_rx_peers, Peers}, State) when is_list(Peers) ->
+    {noreply, State, hibernate};
 
 % @doc A peer worker received a peers bitfield. Store it for the piece
 % scheduling. Note: The tag does not contain a suffix (res/req) due to being a
@@ -464,6 +500,7 @@ handle_info({hash_s_hash_files_res, {_Job_ID, Hashes}}, State) ->
 
     % Reverse to regain correct order
     Bitfield_list_ordered = lists:reverse(Bitfield_list),
+    % TODO calculate new #state.left amount of 1s in the bitfield times piece_length
 
     % Convert list to bitfield
     Bitfield = ?BINARY:list_to_bitfield(Bitfield_list_ordered),
@@ -471,7 +508,7 @@ handle_info({hash_s_hash_files_res, {_Job_ID, Hashes}}, State) ->
     case State#state.start_when_ready of
         true ->
             Tmp_state = State#state{bitfield = Bitfield},
-            New_state = start_torrent(Tmp_state),
+            {ok, New_state} = start_torrent(Tmp_state),
             {noreply, New_state};
         false ->
             New_state = State#state{bitfield = Bitfield,

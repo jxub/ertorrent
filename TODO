@@ -38,6 +38,8 @@ General:
   if someone else is establishing the connection?
 - Figure out how to store the uploaded amount of each torrent since this is a
   part of the tracker announcement
+- TERMS Decide on a term for torrent start_when_ready feature, state =
+  "active"?
 
 file_srv:
 - Implement handle_info({file_w_pread_resp

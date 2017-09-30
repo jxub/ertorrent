@@ -8,11 +8,14 @@
 
 -behaviour(gen_server).
 
--export([add_rx_peer/3,
+-export([
+         add_rx_peer/3,
+         add_rx_peers/3,
          add_tx_peer/2,
          multicast/2,
          remove/1,
-         remove_related/1]).
+         remove_related/1
+        ]).
 
 -export([start_link/0,
          stop/0]).
@@ -41,11 +44,15 @@
                 port_min}).
 
 %%% Client API %%%
-add_rx_peer(Address, Port, Info_hash) ->
-    gen_server:cast(?MODULE, {add_rx_peer, {Address, Port, Info_hash}}).
+add_rx_peer(Info_hash, {Address, Port}) ->
+    gen_server:cast(?MODULE, {peer_s_add_rx_peer, self(), {Info_hash, {Address, Port}}}).
 
-add_tx_peer(Socket, Info_hash) ->
-    gen_server:cast(?MODULE, {add_tx_peer, {Socket, Info_hash}}).
+-spec add_rx_peers(Info_hash::string(), Peers::[tuple()]) -> ok.
+add_rx_peers(Info_hash, Peers) when is_list(Peers) ->
+    gen_server:cast(?MODULE, {peer_s_add_rx_peers, self(), {Info_hash, Peers}}).
+
+add_tx_peer(Info_hash, Socket) ->
+    gen_server:cast(?MODULE, {peer_s_add_tx_peer, {Socket, Info_hash}}).
 
 multicast(Info_hash, Message) ->
     gen_server:cast(?MODULE, {multicast, {Info_hash, Message}}).
@@ -63,6 +70,49 @@ stop() ->
     io:format("Stopping: ~p...~n", [?MODULE]),
     gen_server:cast(?MODULE, stop).
 
+%%% Internal functions
+start_rx_peer(From, Info_hash, {Address, Port}, Own_peer_id) ->
+    ID = erlang:unique_integer(),
+
+    case gen_tcp:connect(Address, Port, [binary, {packet, 0}]) of
+        {ok, Socket} ->
+
+            Ret = ?PEER_SUP:start_child(ID, Info_hash, Own_peer_id, Socket),
+
+            case Ret of
+                % TODO Atm the handling of the {ok, _} responses is redundant.
+                % It's unlikely that both will be used however in the writing
+                % moment this cannot be determined and therefore both are taken
+                % into consideration until one could be ruled out.
+                {ok, Peer_pid} ->
+                    ok = activate(Peer_pid),
+
+                    {ID, Address, Port, Info_hash};
+                {ok, Peer_pid, Info} ->
+                    lager:warning("recv unhandled data Info: '~p'", [Info]),
+                    ok = activate(Peer_pid),
+
+                    {ID, Address, Port, Info_hash};
+                % This is rather unexpected so log it until it is clear when it happens
+                {error, Reason_sup} ->
+                    lager:error("peer_srv failed to spawn a peer_worker (tx), check the peer_sup. reason: '~p'",
+                                [Reason_sup]),
+
+                    % TODO if there's an issue with the peer_sup being
+                    % unresponsive. An alternative could be to message the
+                    % peer_ssup to restart the sup. For now it will only be
+                    % logged.
+
+                    error
+            end;
+        % This is expected, so request new peer information from the torrent worker
+        {error, Reason_connect} ->
+            lager:info("peer_srv failed to establish connection with peer address: '~p', port: '~p', reason: '~p'",
+                       [Addressv, Port, Reason_connect),
+
+            error
+    end.
+
 %%% Callback module
 init(_Args) ->
     {peer_id_str, Own_peer_id} = ?SETTINGS_SRV:get_sync(peer_id_str),
@@ -72,64 +122,39 @@ handle_call(Req, From, State) ->
     ?INFO("unhandled call request: " ++ Req ++ ", from: " ++ From),
     {noreply, State}.
 
-handle_cast({add_rx_peer, {Address, Port, Info_hash}}, State) ->
-    ID = erlang:unique_integer(),
+handle_cast({peer_s_add_rx_peer, From, {Info_hash, {Address, Port}}}, State) ->
+    Ref = start_rx_peer(Info_hash, Peer, State#state.own_peer_id),
 
-    case gen_tcp:connect(Address, Port, [binary, {packet, 0}]) of
-        {ok, Socket} ->
-            Ret = supervisor:start_child(?PEER_SUP,
-                                         [ID,
-                                          [ID,
-                                           Info_hash,
-                                           State#state.own_peer_id,
-                                           Socket]]),
-            case Ret of
-                % TODO Atm the handling of the {ok, _} responses is redundant.
-                % It's unlikely that both will be used however in the writing
-                % moment this cannot be determined and therefore both are taken
-                % into consideration until one could be ruled out.
-                {ok, Peer_pid} ->
-                    Peers = State#state.peers,
+    From ! {peer_s_rx_peers, Ref};
 
-                    ok = gen_server:cast(Peer_pid, transmit),
+handle_cast({peer_s_add_rx_peers, From, {Info_hash, Peers}}, State) ->
+    % Setup peer connections, succeeding peers will return a reference and
+    % failing 'error'.
+    Fold_results = fun(Peer, Acc) ->
+                       Ref = start_rx_peer(Info_hash, Peer,
+                                           State#state.own_peer_id),
 
-                    New_state = State#state{peers=[{ID,
-                                                    Address,
-                                                    Port,
-                                                    Info_hash}| Peers]};
-                {ok, Peer_pid, Info} ->
-                    ?INFO("recv unhandled data 'Info': " ++ Info),
+                       [Ref| Acc]
+                   end,
+    Peer_results = lists:foldl(Fold, [], Peers),
 
-                    Peers = State#state.peers,
+    % Create a list of connected peer workers
+    Filter_errors = fun(Res) ->
+                        case Res of
+                            error -> false;
+                            _ -> true
+                        end
+                    end,
+    Succeeded_peers = lists:filter(Filter_errors, Peer_results),
 
-                    ok = gen_server:cast(Peer_pid, transmit),
+    % Count the amount of failed peer workers
+    Nbr_of_failed_peers = length(Peers) - length(Succeeded_peers),
 
-                    New_state = State#state{peers=[{ID,
-                                                    Address,
-                                                    Port,
-                                                    Info_hash}| Peers]};
+    % Request new peers corresponding to the amount of the failed peers
+    ok = ?TORRENT_W:request_peers(From, Nbr_of_failed_peers),
 
-                {error, Reason_sup} ->
-                    ?ERROR("peer_srv failed to spawn a peer_worker (tx), check the peer_sup. reason: "
-                           ++ Reason_sup),
-
-                    % TODO if there's an issue with the peer_sup being
-                    % unresponsive. An alternative could be to message the
-                    % peer_ssup to restart the sup. For now it will only be
-                    % logged.
-
-                    New_state = State
-            end,
-
-            {noreply, New_state};
-        {error, Reason_connect} ->
-            ?INFO("peer_srv failed to establish connection with peer: " ++
-                  Address ++ ":" ++ Port ++ ", reason: " ++ Reason_connect),
-
-            ?TORRENT_SRV ! {peer_srv, requesting_peer},
-
-            {noreply, State}
-    end;
+    % Send back the list of connected peers
+    From ! {peer_s_rx_peers, Succeeded_peers};
 
 % @doc Adding a transmitting peer worker. The socket is already accepted by the
 % peer accept-process. Note: When mentioning the terms receiving and
@@ -194,7 +219,7 @@ handle_cast({add_tx_peer, {Socket, Info_hash}}, State) ->
 
             New_state = State
     end,
-    {noreply, New_state};
+    {noreply, New_state, hibernate};
 handle_cast({multicast, {Info_hash_x, Message}}, State) ->
     F = fun({ID, _Address, _Port, Info_hash_y}) ->
         case Info_hash_x =:= Info_hash_y of
@@ -205,7 +230,7 @@ handle_cast({multicast, {Info_hash_x, Message}}, State) ->
 
     lists:foreach(F, State#state.peers),
 
-    {noreply, State};
+    {noreply, State, hibernate};
 handle_cast(stop, State) ->
     {stop, normal, State}.
 

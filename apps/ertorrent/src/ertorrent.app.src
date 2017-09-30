@@ -10,9 +10,13 @@
     sasl,
     inets,
     os_mon,
-
+    % hackey deps
+    crypto,
+    public_key,
+    ssl,
     % upstream
-    lager,
+    lager, % want the logging to start up first
+    hackney,
     cowboy
    ]},
   {mod, {ertorrent_app, []}},
