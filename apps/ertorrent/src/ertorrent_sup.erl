@@ -8,7 +8,7 @@
 
 -define(SUPERVISOR(Module), {Module,
                              {Module, start_link, []},
-                             transient, infinity, supervisor, [Module]}).
+                             permanent, infinity, supervisor, [Module]}).
 
 -define(SERVER(Module), {Module,
                          {Module, start_link, []},

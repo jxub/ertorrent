@@ -83,14 +83,13 @@ handle_call({torrent_s_add_torrent, Metainfo, Start_when_ready}, _From, State) -
     % Creating info hash
     {ok, Info} = ?METAINFO:get_value(<<"info">>, Metainfo),
     {ok, Info_encoded} = ?BENCODE:encode(Info),
-    {ok, Info_hash} = ?UTILS:encode_hash(Info_encoded),
+    {ok, Info_hash} = ?UTILS:hash_digest_to_string(Info_encoded),
 
     % Preparing torrent tuple
     Torrent = {Info_hash, Metainfo},
     Current_torrents = State#state.torrents,
 
-    Torrent_ID = list_to_atom(Info_hash),
-    case ertorrent_torrent_sup:start_child(Torrent_ID, [Info_hash, Metainfo, Start_when_ready]) of
+    case ?TORRENT_SUP:start_child([Metainfo, Start_when_ready]) of
         {ok, _Child} ->
             % Adding torrent tuple to the bookkeeping list
             New_state = State#state{torrents = [Torrent|Current_torrents]},

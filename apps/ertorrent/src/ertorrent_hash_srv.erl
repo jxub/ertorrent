@@ -221,13 +221,13 @@ hash_files_int(Job_ID, [{Index,
     end.
 
 init(_Args) ->
-    lager:warning("starting hash_srv", []),
+    lager:debug("~p: '~p'", [?MODULE, ?FUNCTION_NAME]),
     {ok, #state{jobs=[]}, hibernate}.
 
 % _Reason is defined as unused to avoid compilation warning when not building
 % as debug.
-terminate(_Reason, _State) ->
-    ?DEBUG("shutting down: " ++ _Reason),
+terminate(Reason, _State) ->
+    lager:info("shutting down: '~p'", [Reason]),
     ok.
 
 handle_call(terminate, _From, State) ->
@@ -253,8 +253,6 @@ handle_cast({hash_s_hash_files, From, Job_ID, Mapping}, State) ->
     {noreply, New_state}.
 
 handle_info({collect_hashed_pieces, {Job_ID, Index, Hash}}, State) ->
-    lager:debug("collect_hashed_pieces"),
-
     case lists:keyfind(Job_ID, #job.id, State#state.jobs) of
         false ->
             lager:error("failed to find the job for a hashed piece"),
@@ -278,7 +276,7 @@ handle_info({collect_hashed_pieces, {Job_ID, Index, Hash}}, State) ->
                     % Remove the completed job from the list
                     New_jobs = lists:keydelete(Job_ID, #job.id, State#state.jobs),
 
-                    lager:debug("finished hashing '~p'", Job_ID),
+                    lager:debug("finished hashing '~p'", [Job_ID]),
 
                     % Send the hash response
                     New_job#job.from ! {hash_s_hash_files_res, {Job_ID, Piece_hashes}}

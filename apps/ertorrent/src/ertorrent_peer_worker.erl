@@ -10,14 +10,17 @@
 
 -behaviour(gen_server).
 
--export([reset_rx_keep_alive/1,
+-export([
+         connect/1,
+         reset_rx_keep_alive/1,
          reset_tx_keep_alive/1,
-         send_keep_alive/1,
-         activate/1]).
+         send_keep_alive/1
+        ]).
 
--export([start/5,
+-export([
          start_link/5,
-         stop/1]).
+         stop/1
+        ]).
 
 -export([init/1,
          handle_call/3,
@@ -32,7 +35,9 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--record(state, {request_buffer::list(),
+-record(state, {
+                address,
+                request_buffer::list(),
                 dht_port,
                 id, % peer_worker_id
                 incoming_piece::binary(),
@@ -58,6 +63,7 @@
                 peer_srv_pid,
                 peer_choked,
                 peer_interested,
+                port::integer(),
                 received_handshake::boolean(),
                 socket,
                 self_choked,
@@ -66,8 +72,10 @@
                 state_outgoing,
                 torrent_bitfield,
                 torrent_info_hash,
+                torrent_info_hash_bin,
                 torrent_peer_id,
-                torrent_pid}).
+                torrent_pid
+               }).
 
 % 16KB seems to be an inofficial standard among most torrent client
 % implementations. Link to the discussion:
@@ -87,17 +95,13 @@
 %%% Extended client API
 
 % Instructing the peer worker to start leeching
-activate(ID) ->
-    gen_server:cast(ID, peer_w_activate).
+connect(ID) ->
+    gen_server:cast(ID, peer_w_connect).
 
 %%% Standard client API
-
-% ID should be the address converted into an atom
-start(ID, Info_hash, Peer_id, Socket, Torrent_pid) when is_atom(ID) ->
-    gen_server:start({local, ID}, ?MODULE, [ID, Info_hash, Peer_id, Socket, Torrent_pid], []).
-
-start_link(ID, Info_hash, Peer_id, Socket, Torrent_pid) when is_atom(ID) ->
-    gen_server:start_link({local, ID}, ?MODULE, [ID, Info_hash, Peer_id, Socket, Torrent_pid], []).
+start_link(ID, Info_hash, Peer_id, Socket, Torrent_pid) ->
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
+    gen_server:start_link(?MODULE, [ID, Info_hash, Peer_id, Socket, Torrent_pid], [{hibernate_after, 2000}]).
 
 stop(ID) ->
     io:format("stopping~n"),
@@ -165,22 +169,41 @@ complete_piece(State) ->
     {ok, New_state}.
 
 %%% Callback module
-init([ID, Info_hash, Peer_id, Socket, Torrent_pid]) when is_atom(ID) ->
+init([ID, Info_hash, Peer_id, {Address, Port}, Torrent_pid]) when is_integer(ID)
+                                                             andalso is_binary(Info_hash) ->
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
     {ok, #state{id=ID,
+                address=Address,
                 peer_id=Peer_id, % TODO Should this be retreived from settings_srv?
                 peer_choked = true,
                 peer_interested = true,
-                socket=Socket,
-                torrent_info_hash=Info_hash,
-                torrent_pid=Torrent_pid}}.
+                port=Port,
+                torrent_info_hash_bin=Info_hash,
+                torrent_pid=Torrent_pid}, hibernate}.
 
 terminate(Reason, State) ->
-    ?INFO("peer worker terminating: " ++ Reason),
+    lager:debug("~p: ~p: terminating, reason: '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
 
-    erlang:cancel_timer(State#state.keep_alive_rx_ref),
-    erlang:cancel_timer(State#state.keep_alive_tx_ref),
+    case State#state.keep_alive_rx_ref /= undefined of
+        false ->
+            ok;
+        true ->
+            erlang:cancel_timer(State#state.keep_alive_rx_ref)
+    end,
 
-    ok = gen_tcp:close(State#state.socket),
+    case State#state.keep_alive_tx_ref /= undefined of
+        false ->
+            ok;
+        true ->
+            erlang:cancel_timer(State#state.keep_alive_tx_ref)
+    end,
+
+    case State#state.socket /= undefined of
+        false ->
+            ok;
+        true ->
+            ok = gen_tcp:close(State#state.socket)
+    end,
 
     State#state.torrent_pid ! {peer_w_terminate,
                                State#state.id,
@@ -193,47 +216,70 @@ handle_call(_Req, _From, State) ->
     {noreply, State}.
 
 %% Asynchronous
-handle_cast(activate, State) ->
-    Info_hash = State#state.torrent_info_hash,
-    Peer_id = State#state.peer_id,
+handle_cast(peer_w_connect, State) ->
+    lager:debug("~p: ~p: connect", [?MODULE,
+                                    ?FUNCTION_NAME]),
 
-    case gen_tcp:send(State#state.socket,
-                      <<19:32, "BitTorrent protocol":152, 0:64,
-                        Info_hash:160,
-                        Peer_id:160>>) of
-        ok ->
-            % This is automatically canceled if the process terminates
-            Keep_alive_tx_ref = erlang:send_after(?KEEP_ALIVE_TX_TIMER,
-                                                  self(),
-                                                  {keep_alive_tx_timeout}),
+    Peer_id = list_to_binary(State#state.peer_id),
+    {ok, Handshake} = ?PEER_PROTOCOL:msg_handshake(State#state.torrent_info_hash_bin,
+                                                   Peer_id),
 
-            Keep_alive_rx_ref = erlang:send_after(?KEEP_ALIVE_RX_TIMER,
-                                                  self(),
-                                                  {keep_alive_rx_timeout}),
+    case gen_tcp:connect(State#state.address,
+                         State#state.port, [binary, {packet, 0}], 2000) of
+        {ok, Socket} ->
+            lager:debug("~p: ~p: connected to peer '~p:~p'", [?MODULE,
+                                                              ?FUNCTION_NAME,
+                                                              State#state.address,
+                                                              State#state.port
+                                                             ]),
+            case gen_tcp:send(Socket,
+                              Handshake) of
+                ok ->
+                    lager:debug("~p: ~p: successfully sent handshake", [?MODULE, ?FUNCTION_NAME]),
+                    % This is automatically canceled if the process terminates
+                    Keep_alive_tx_ref = erlang:send_after(?KEEP_ALIVE_TX_TIMER,
+                                                          self(),
+                                                          {keep_alive_tx_timeout}),
 
-            {noreply,
-             State#state{keep_alive_rx_ref=Keep_alive_rx_ref,
-                         keep_alive_tx_ref=Keep_alive_tx_ref},
-             hibernate};
-        {error, Reason} ->
-            {stop, {error_handshake, Reason}}
+                    Keep_alive_rx_ref = erlang:send_after(?KEEP_ALIVE_RX_TIMER,
+                                                          self(),
+                                                          {keep_alive_rx_timeout}),
+
+                    {noreply,
+                     State#state{keep_alive_rx_ref=Keep_alive_rx_ref,
+                                 keep_alive_tx_ref=Keep_alive_tx_ref,
+                                 socket=Socket},
+                     hibernate};
+                {error, Reason} ->
+                    lager:debug("~p: ~p: failed send handshake, reason: '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
+                    {stop, {error_handshake, Reason}}
+            end;
+        {error, Reason_connect} ->
+            lager:debug("~p: ~p: peer_srv failed to establish connection with peer address: '~p', port: '~p', reason: '~p'",
+                        [?MODULE,
+                         ?FUNCTION_NAME,
+                         State#state.address,
+                         State#state.port,
+                         Reason_connect]),
+
+            error
     end;
 handle_cast(stop, State) ->
     {stop, normal, State};
 handle_cast(Request, State) ->
-    ?WARNING("unhandled request: " ++ Request),
+    lager:warning("~p: ~p: unhandled request: '~p'", [?MODULE, ?FUNCTION_NAME, Request]),
     {noreply, State}.
 
 %% Timeout for when a keep alive message was expected from the peer
 handle_info({keep_alive_rx_timeout}, State) ->
-    {stop, peer_worker_timed_out, State};
+    {stop, peer_worker_timed_out, State, hibernate};
 
 %% Time to send another keep alive before the peer mark us as inactive
 handle_info({keep_alive_tx_timeout}, State) ->
     case send_keep_alive(State#state.socket) of
         {ok, Timer_ref} ->
             New_state = State#state{keep_alive_tx_ref=Timer_ref},
-            {noreply, New_state};
+            {noreply, New_state, hibernate};
         {error, Reason} ->
             {stop, Reason, State}
     end;
@@ -291,7 +337,7 @@ handle_info({peer_srv_tx_piece, Index, Hash, Data}, State) ->
     New_state = State#state{request_buffer = Remaining_requests,
                             outgoing_piece_queue = Outgoing_pieces},
 
-    {noreply, New_state};
+    {noreply, New_state, hibernate};
 
 %% Messages from gen_tcp
 % TODO:
@@ -303,8 +349,10 @@ handle_info({tcp, _S, <<>>}, State) ->
 
     New_state = State#state{keep_alive_rx_ref=New_keep_alive_rx_ref},
 
-    {noreply, New_state};
+    {noreply, New_state, hibernate};
 handle_info({tcp, _S, <<?HAVE, Piece_idx:32/big-integer>>}, State) ->
+    lager:debug("~p: HAVE, piece index: '~p'", [?FUNCTION_NAME, Piece_idx]),
+
     New_bitfield = ?BINARY:set_bit(Piece_idx, 1, State#state.peer_bitfield),
 
     State#state.peer_srv_pid ! {peer_w_bitfield_update, New_bitfield},
@@ -317,8 +365,11 @@ handle_info({tcp, _S, <<?HAVE, Piece_idx:32/big-integer>>}, State) ->
     New_state = State#state{outgoing_piece_queue = Outgoing_pieces,
                             peer_bitfield = New_bitfield},
 
-    {noreply, New_state};
+    {noreply, New_state, hibernate};
 handle_info({tcp, _S, <<?REQUEST, Index:32/big, Begin:32/big, Length:32/big>>}, State) ->
+    lager:debug("~p: REQUEST, index: '~p', begin: '~p', length: '~p'",
+                [?FUNCTION_NAME, Index, Begin, Length]),
+
     case lists:keyfind(Index, 1, State#state.outgoing_piece_queue) of
         {Index, _Hash, Data} ->
             <<Begin, Block:Length, _Rest/binary>> = Data,
@@ -344,10 +395,11 @@ handle_info({tcp, _S, <<?REQUEST, Index:32/big, Begin:32/big, Length:32/big>>}, 
             New_state = State#state{request_buffer=Request_buffer}
     end,
 
-    {noreply, New_state};
+    {noreply, New_state, hibernate};
 handle_info({tcp, _S, <<?PIECE, Index:32/big-integer, Begin:32/big-integer,
                         Data/binary>>}, State) ->
-    ?INFO("piece index: " ++ Index ++ " begin: " ++ Begin),
+    lager:debug("~p: PIECE, index: '~p', begin: '~p'", [?FUNCTION_NAME, Index, Begin]),
+
     % Check that the piece is requested
     case Index == State#state.incoming_piece_index of
         true ->

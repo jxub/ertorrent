@@ -11,13 +11,19 @@
 
 -behaviour(gen_server).
 
--export([activate/1,
+-export([
+         activate/1,
          deactivate/1,
          shutdown/1,
+         start_torrent/1,
+         request_peers/2
+        ]).
+
+-export([
          start/1,
          start_link/2,
-         start_torrent/1,
-         stop/1]).
+         stop/1
+        ]).
 
 -export([init/1,
          handle_call/3,
@@ -28,6 +34,7 @@
 -include("ertorrent_log.hrl").
 
 -define(ANNOUNCE_TIME, 120).
+-define(BENCODE, ertorrent_bencode).
 -define(BINARY, ertorrent_binary_utils).
 -define(FILE_SRV, ertorrent_file_srv).
 -define(HASH_SRV, ertorrent_hash_srv).
@@ -73,7 +80,8 @@
                 files::tuple(), % Files tuple e.g. {files, multiple, Name, Files_list}
                 file_paths::list(),
                 file_worker::integer(), % The ID for file workers are unique integers
-                info_hash::string(),
+                info_hash_str::string(),
+                info_hash_bin::binary(),
                 left::integer(), % Tracker information about how much is left to download
                 length::integer(), % Total length of the torrent contents
                 locations::list(),
@@ -112,8 +120,9 @@ request_peers(Torrent_w_id, Amount_of_peers) ->
     gen_server:cast(Torrent_w_id, {torrent_w_request_peers, self(), Amount_of_peers}).
 
 % Starting server
-start_link(Info_hash_atom, [Info_hash, Metainfo, Start_when_ready]) when is_atom(Info_hash_atom) ->
-    gen_server:start_link({local, Info_hash_atom}, ?MODULE, [Info_hash, Metainfo, Start_when_ready], []).
+start_link(ID, Args) ->
+    lager:debug("~p: ~p: id: '~p'", [?MODULE, ?FUNCTION_NAME, ID]),
+    gen_server:start_link(?MODULE, Args, [{hibernate_after, 2000}]).
 
 % Shutting down the server
 shutdown(Name) ->
@@ -135,7 +144,7 @@ stop(Name) when is_atom(Name) ->
 tracker_announce_loop(State) ->
     % TODO make this async
     {ok, Response} = ?TRACKER:announce2(State#state.announce,
-                                        State#state.info_hash,
+                                        State#state.info_hash_str,
                                         State#state.peer_id,
                                         State#state.peer_listen_port,
                                         State#state.uploaded,
@@ -188,16 +197,24 @@ start_torrent(State) ->
 % TODO:
 % - Gather every value fetched from the metainfo, re-group and maybe split up
 % the contents of this function.
-init([Info_hash, Metainfo, Start_when_ready]) ->
-    ?DEBUG("starting to initialize torrent worker: \ninfo_hash: " ++ Info_hash
-           ++ "\nmetainfo: " ++ Metainfo ++ "\nstart_when_ready: " ++
-           Start_when_ready),
+init([Metainfo, Start_when_ready]) ->
+    lager:debug("~p: ~p: metainfo: '~p', start_when_ready: '~p'",
+                [?MODULE,
+                 ?FUNCTION_NAME,
+                 Metainfo,
+                 Start_when_ready]),
+
+    % Creating info hash
+    {ok, Info} = ?METAINFO:get_value(<<"info">>, Metainfo),
+    {ok, Info_encoded} = ?BENCODE:encode(Info),
+    Info_hash_bin = crypto:hash(sha, Info_encoded),
+    {ok, Info_hash_str} = ?UTILS:hash_digest_to_string(Info_encoded),
 
     {ok, Announce_address} = ?METAINFO:get_value(<<"announce">>, Metainfo),
-    {ok, Piece_length} = ?METAINFO:get_info_value(<<"piece length">>, Metainfo),
+    {ok, Piece_length} = ?METAINFO:get_value(<<"piece length">>, Info),
     % Prepare a list of pieces since, the piece section of the metainfo
     % consists of a concatenated binary of all the pieces.
-    {ok, Pieces_bin} = ?METAINFO:get_info_value(<<"pieces">>, Metainfo),
+    {ok, Pieces_bin} = ?METAINFO:get_value(<<"pieces">>, Info),
 
     Resolved_files = ?METAINFO:resolve_files(Metainfo),
 
@@ -248,7 +265,8 @@ init([Info_hash, Metainfo, Start_when_ready]) ->
                    event = stopped,
                    files = Resolved_files,
                    file_paths = File_paths,
-                   info_hash = Info_hash,
+                   info_hash_bin = Info_hash_bin,
+                   info_hash_str = Info_hash_str,
                    left = Length,
                    length = Length,
                    metainfo = Metainfo,
@@ -293,8 +311,7 @@ handle_cast({start}, State) ->
         _ ->
             New_state = State,
 
-            ?ERROR("torrent worker in a broken state: " ++
-                   atom_to_list(State#state.state))
+            lager:error("torrent worker in a broken state: '~p'", [atom_to_list(State#state.state)])
     end,
 
     {reply, started, New_state};
@@ -311,8 +328,6 @@ handle_info({torrent_w_tracker_announce_loop}, State) ->
     {noreply, New_state};
 
 handle_info({tracker_announce, Response}, State) ->
-    lager:warning("~p: ref '~p'", [?FUNCTION_NAME, self()]),
-    lager:warning("state: ~p", [State]),
     % Using utility function from metainfo since operates on bdecoded
     % structures.
     % TODO Check if this will be use full in the future otherwise remove it
@@ -365,8 +380,10 @@ handle_info({tracker_announce, Response}, State) ->
             % Create a list, equal to the amount of missing peers, to activate
             {Peers_activate, Peers_rest} = lists:split(Missing_nbr_peers, Peer_list),
 
+            lager:debug("peers: ~p", [Peer_list]),
+
             % Tell the torrent_s to start the peers
-            ?PEER_SRV:add_rx_peers(State#state.info_hash, Peers_activate);
+            ?PEER_SRV:add_rx_peers(State#state.info_hash_bin, Peers_activate);
         false ->
             lager:warning("nothing to do here"),
             Peers_rest = Peer_list
@@ -451,8 +468,14 @@ handle_info({file_w_write_offset_res, _From, {_Info_hash, _Piece_idx}}, State) -
 % up a new peer worker if it's necessary.
 % @end
 handle_info({peer_w_terminate, ID, _Current_piece_index}, State) ->
-    % Remove the peer_w's bitfield
-    New_bitfields = lists:keytake(ID, 1, State#state.bitfields),
+    case State#state.bitfields /= undefined of
+        true ->
+            % Remove the peer_w's bitfield
+            New_bitfields = lists:keytake(ID, 1, State#state.bitfields),
+            New_state = State#state{bitfields = New_bitfields};
+        false ->
+            New_state = State
+    end,
 
     % TODO
     % - trigger an update of the algorithm module
@@ -461,16 +484,16 @@ handle_info({peer_w_terminate, ID, _Current_piece_index}, State) ->
 
     % Fire up a new peer_w
 
-    New_state = State#state{bitfields = New_bitfields},
 
-    {noreply, New_state};
+    {noreply, New_state, hibernate};
 
 %% Response form hashing a single piece
 %% TODO update the bitfield and update downloaded, left if the piece hashes match
 %% - Match the piece hashes
 %% - If piece is ok, look up a new one and ask the peer_w for that one.
 handle_info({torrent_s_hash_piece_resp, _Index, _Hash}, State) ->
-    {noreply, State};
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
+    {noreply, State, hibernate};
 
 %% Response from the initial hashing
 %% TODO update the values of downloaded, left
@@ -479,7 +502,7 @@ handle_info({torrent_s_hash_piece_resp, _Index, _Hash}, State) ->
 % of initialization of a torrent worker.
 % @end
 handle_info({hash_s_hash_files_res, {_Job_ID, Hashes}}, State) ->
-    lager:warning("recv hash_s_hash_files_res", []),
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 
     % Construct a list of the to list in the form [{X_hash, Y_hash}, {X_hash1,
     % Y_hash1}]. Now the comparison can be done in one iteration of the ziped

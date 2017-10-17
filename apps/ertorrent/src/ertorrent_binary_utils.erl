@@ -49,11 +49,7 @@ parse_peers4(Peers) when is_binary(Peers) ->
 
 parse_peers4(<<>>, Acc) ->
     Acc;
-parse_peers4(<<A:8/big-integer,
-               B:8/big-integer,
-               C:8/big-integer,
-               D:8/big-integer,
-               Port:16/big-integer, Rest/binary>>, Acc) ->
+parse_peers4(<<A, B, C, D, Port:16, Rest/binary>>, Acc) ->
     Address = {A, B, C, D},
     parse_peers4(Rest, [{Address, Port}| Acc]);
 parse_peers4(Unmatched, _Acc) ->

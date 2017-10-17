@@ -43,6 +43,7 @@ announce2(Address, Info_hash, Peer_id, Port, Uploaded, Downloaded, Left, Event, 
                                            Left,
                                            Event,
                                            0),
+    lager:debug("~p: ~p: prepared request '~p'", [?MODULE, ?FUNCTION_NAME, Request]),
 
     case hackney:request(get, list_to_binary(Request), [], <<>>, []) of
         {ok, _StatusCode, _Headers, ClientRef} ->

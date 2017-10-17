@@ -19,7 +19,7 @@
 % parse_length_prefixed_value(Length, Bitstring) ->
 %     <<Value:Length/big-integer-unit:8, Rest>> = Bitstring,
 %     {ok, {Value, Rest}}.
-% 
+%
 % parse_message(Bytestring) ->
 %     parse_message(Bytestring, []).
 % parse_message(<<>>, Acc) ->
@@ -39,7 +39,11 @@
 %     end.
 
 msg_handshake(Info_hash, Peer_id) ->
-    {ok, <<19:32, "BitTorrent protocol", 0:64, Info_hash:160, Peer_id:160>>}.
+    {ok, <<19:8/integer,
+           "BitTorrent protocol"/integer,
+           0:64/big,
+           Info_hash:20/binary,
+           Peer_id:20/binary>>}.
 
 msg_keep_alive() ->
     {ok, <<0:32>>}.

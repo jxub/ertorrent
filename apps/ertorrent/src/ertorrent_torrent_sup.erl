@@ -2,7 +2,7 @@
 
 -behaviour(supervisor).
 
--export([start_child/2,
+-export([start_child/1,
          start_link/0,
          init/1]).
 
@@ -13,7 +13,9 @@
                            type => worker,
                            modules => [ertorrent_torrent_worker]}).
 
-start_child(ID, Args) ->
+start_child(Args) ->
+    ID = erlang:unique_integer(),
+    lager:debug("~p: ~p: id: '~p'", [?MODULE, ?FUNCTION_NAME, ID]),
     supervisor:start_child(?MODULE, ?CHILD(ID, Args)).
 
 start_link() ->

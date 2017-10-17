@@ -9,8 +9,8 @@
 -behaviour(gen_server).
 
 -export([
-         add_rx_peer/3,
-         add_rx_peers/3,
+         add_rx_peer/2,
+         add_rx_peers/2,
          add_tx_peer/2,
          multicast/2,
          remove/1,
@@ -32,7 +32,9 @@
 -define(SETTINGS_SRV, ertorrent_settings_srv).
 -define(PEER_SUP, ertorrent_peer_sup).
 -define(PEER_SSUP, ertorrent_peer_ssup).
+-define(PEER_W, ertorrent_peer_worker).
 -define(TORRENT_SRV, ertorrent_torrent_srv).
+-define(TORRENT_W, ertorrent_torrent_worker).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -52,7 +54,7 @@ add_rx_peers(Info_hash, Peers) when is_list(Peers) ->
     gen_server:cast(?MODULE, {peer_s_add_rx_peers, self(), {Info_hash, Peers}}).
 
 add_tx_peer(Info_hash, Socket) ->
-    gen_server:cast(?MODULE, {peer_s_add_tx_peer, {Socket, Info_hash}}).
+    gen_server:cast(?MODULE, {peer_s_add_tx_peer, self(), {Socket, Info_hash}}).
 
 multicast(Info_hash, Message) ->
     gen_server:cast(?MODULE, {multicast, {Info_hash, Message}}).
@@ -71,44 +73,37 @@ stop() ->
     gen_server:cast(?MODULE, stop).
 
 %%% Internal functions
-start_rx_peer(From, Info_hash, {Address, Port}, Own_peer_id) ->
+start_rx_peer(From, Info_hash, {Address, Port}, Own_peer_id) when is_binary(Info_hash) ->
     ID = erlang:unique_integer(),
+    Ret = ?PEER_SUP:start_child(ID, Info_hash, Own_peer_id, {Address, Port}, From),
 
-    case gen_tcp:connect(Address, Port, [binary, {packet, 0}]) of
-        {ok, Socket} ->
+    case Ret of
+        % TODO Atm the handling of the {ok, _} responses is redundant.
+        % It's unlikely that both will be used however in the writing
+        % moment this cannot be determined and therefore both are taken
+        % into consideration until one could be ruled out.
+        {ok, Peer_pid} ->
+            lager:debug("~p: ~p: connecting to peer '~p:~p'", [?MODULE,
+                                                               ?FUNCTION_NAME,
+                                                               Address,
+                                                               Port]),
+            ok = ?PEER_W:connect(Peer_pid),
 
-            Ret = ?PEER_SUP:start_child(ID, Info_hash, Own_peer_id, Socket),
+            {ID, Address, Port, Info_hash};
+        {ok, Peer_pid, Info} ->
+            lager:warning("recv unhandled data Info: '~p'", [Info]),
+            ok = ?PEER_W:activate(Peer_pid),
 
-            case Ret of
-                % TODO Atm the handling of the {ok, _} responses is redundant.
-                % It's unlikely that both will be used however in the writing
-                % moment this cannot be determined and therefore both are taken
-                % into consideration until one could be ruled out.
-                {ok, Peer_pid} ->
-                    ok = activate(Peer_pid),
+            {ID, Address, Port, Info_hash};
+        % This is rather unexpected so log it until it is clear when it happens
+        {error, Reason_sup} ->
+            lager:error("peer_srv failed to spawn a peer_worker (rx), check the peer_sup. reason: '~p'",
+                        [Reason_sup]),
 
-                    {ID, Address, Port, Info_hash};
-                {ok, Peer_pid, Info} ->
-                    lager:warning("recv unhandled data Info: '~p'", [Info]),
-                    ok = activate(Peer_pid),
-
-                    {ID, Address, Port, Info_hash};
-                % This is rather unexpected so log it until it is clear when it happens
-                {error, Reason_sup} ->
-                    lager:error("peer_srv failed to spawn a peer_worker (tx), check the peer_sup. reason: '~p'",
-                                [Reason_sup]),
-
-                    % TODO if there's an issue with the peer_sup being
-                    % unresponsive. An alternative could be to message the
-                    % peer_ssup to restart the sup. For now it will only be
-                    % logged.
-
-                    error
-            end;
-        % This is expected, so request new peer information from the torrent worker
-        {error, Reason_connect} ->
-            lager:info("peer_srv failed to establish connection with peer address: '~p', port: '~p', reason: '~p'",
-                       [Addressv, Port, Reason_connect),
+            % TODO if there's an issue with the peer_sup being
+            % unresponsive. An alternative could be to message the
+            % peer_ssup to restart the sup. For now it will only be
+            % logged.
 
             error
     end.
@@ -123,20 +118,26 @@ handle_call(Req, From, State) ->
     {noreply, State}.
 
 handle_cast({peer_s_add_rx_peer, From, {Info_hash, {Address, Port}}}, State) ->
-    Ref = start_rx_peer(Info_hash, Peer, State#state.own_peer_id),
+    lager:debug("~p: ~p: peer_s_add_rx_peer", [?MODULE, ?FUNCTION_NAME]),
 
-    From ! {peer_s_rx_peers, Ref};
+    Ref = start_rx_peer(From, Info_hash, {Address, Port}, State#state.own_peer_id),
+
+    From ! {peer_s_rx_peers, Ref},
+
+    {noreply, State, hibernate};
 
 handle_cast({peer_s_add_rx_peers, From, {Info_hash, Peers}}, State) ->
+    lager:debug("~p: ~p: peer_s_add_rx_peers", [?MODULE, ?FUNCTION_NAME]),
+
     % Setup peer connections, succeeding peers will return a reference and
     % failing 'error'.
     Fold_results = fun(Peer, Acc) ->
-                       Ref = start_rx_peer(Info_hash, Peer,
+                       Ref = start_rx_peer(From, Info_hash, Peer,
                                            State#state.own_peer_id),
 
                        [Ref| Acc]
                    end,
-    Peer_results = lists:foldl(Fold, [], Peers),
+    Peer_results = lists:foldl(Fold_results, [], Peers),
 
     % Create a list of connected peer workers
     Filter_errors = fun(Res) ->
