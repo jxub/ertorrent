@@ -178,6 +178,7 @@ init([ID, Info_hash, Peer_id, {Address, Port}, Torrent_pid]) when is_integer(ID)
                 peer_choked = true,
                 peer_interested = true,
                 port=Port,
+                received_handshake = false,
                 torrent_info_hash_bin=Info_hash,
                 torrent_pid=Torrent_pid}, hibernate}.
 
@@ -235,7 +236,7 @@ handle_cast(peer_w_connect, State) ->
             case gen_tcp:send(Socket,
                               Handshake) of
                 ok ->
-                    lager:debug("~p: ~p: successfully sent handshake", [?MODULE, ?FUNCTION_NAME]),
+                    lager:debug("~p: ~p: sent handshake", [?MODULE, ?FUNCTION_NAME]),
                     % This is automatically canceled if the process terminates
                     Keep_alive_tx_ref = erlang:send_after(?KEEP_ALIVE_TX_TIMER,
                                                           self(),
@@ -380,7 +381,8 @@ handle_info({tcp, _S, <<?REQUEST, Index:32/big, Begin:32/big, Length:32/big>>}, 
             % cached pieces
             case gen_tcp:send(State#state.socket, Msg) of
                 {error, Reason} ->
-                    ?WARNING("failed to send a REQUEST response: " ++ Reason)
+                    lager:warning("~p: ~p: failed to send a REQUEST response: '~p'",
+                                  [?MODULE, ?FUNCTION_NAME, Reason])
             end,
 
             New_state = State;
@@ -490,23 +492,39 @@ handle_info({tcp, _S, <<?CANCEL, Index:32/big, Begin:32/big, Len:32/big>>},
                             outgoing_piece_queue = New_tx_pieces},
 
     {noreply, New_state};
-handle_info({tcp, _S, <<19:32, "BitTorrent protocol", 0:64, Info_hash:160,
-                        _Peer_id:160>>}, State) ->
+handle_info({tcp, _S, <<19/integer,
+                        "BitTorrent protocol",
+                        Flags:8/bytes,
+                        Info_hash:20/bytes,
+                        Peer_id/bytes>>}, % Put the rest of the message into peer id, seen cases where this is 25 bytes and should be 20 bytes
+             State)  ->
+    lager:debug("~p: ~p: received a handshake,~nflags: '~p',~ninfo hash: '~p',~npeer id: '~p'",
+                [
+                 ?MODULE,
+                 ?FUNCTION_NAME,
+                 Flags,
+                 binary_to_list(Info_hash),
+                 binary_to_list(Peer_id)
+                ]),
+
     % TODO add validation of Peer_id
-    case string:equals(State#state.torrent_info_hash, Info_hash) of
+    case State#state.torrent_info_hash_bin == Info_hash of
         true when State#state.received_handshake =:= false ->
             New_state = State#state{received_handshake=true},
-            {noreply, New_state};
+            {noreply, New_state, hibernate};
         true when State#state.received_handshake =:= true ->
-            ?INFO("received multiple handshakes for peer: " ++ State#state.id),
-            {noreply, State};
+            lager:info("~p: ~p: received multiple handshakes for peer: '~p'",
+                       [?MODULE, ?FUNCTION_NAME, State#state.id]),
+            {noreply, State, hibernate};
         false ->
-            ?WARNING("received invalid info hash in handshake for peer: " ++ State#state.id),
+            lager:warning("~p: ~p: received invalid info hash in handshake for peer: '~p'",
+                          [?MODULE, ?FUNCTION_NAME, State#state.id]),
             {stop, "invalid handshake", State}
     end;
 
 handle_info({tcp, _S, <<?BITFIELD, Bitfield/binary>>}, State) ->
-    ?INFO("peer[" ++ State#state.id ++ "] received bitfield: " ++ Bitfield),
+    lager:info("~p: ~p: peer '~p' received bitfield: '~p'",
+               [?MODULE, ?FUNCTION_NAME, State#state.id, Bitfield]),
 
     State#state.peer_srv_pid ! {peer_w_bitfield, Bitfield},
 
@@ -516,6 +534,11 @@ handle_info({tcp, _S, <<?PORT, Port:16/big>>}, State) ->
     {noreply, New_state};
 handle_info({tcp_closed, _S}, State) ->
     {stop, peer_connection_closed, State};
+handle_info({tcp, _S, Message}, State) ->
+    lager:warning("~p: ~p: peer '~p' received an unhandled tcp message: '~p'",
+                  [?MODULE, ?FUNCTION_NAME, State#state.id, Message]),
+    {stop, peer_unhandled_message, State}.
 handle_info(Message, State) ->
-    ?WARNING("peer[" ++ State#state.id ++ "] an invalid request: " ++ Message),
+    lager:warning("~p: ~p: peer '~p' received an unhandled message: '~p'",
+                  [?MODULE, ?FUNCTION_NAME, State#state.id, Message]),
     {stop, peer_unhandled_message, State}.

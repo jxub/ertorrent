@@ -171,14 +171,16 @@ tracker_announce_loop(State) ->
     {ok, Ref}.
 
 start_torrent(State) ->
-    lager:warning("~p: ref '~p'", [?FUNCTION_NAME, self()]),
+    lager:debug("~p: ~p: ref '~p'", [?MODULE, ?FUNCTION_NAME, self()]),
     % Ensure that the directory structure is alright
     lists:foreach(fun(Path) ->
                       case filelib:ensure_dir(Path) of
                           ok ->
-                              ?DEBUG("ensured path: " ++ Path);
+                              lager:debug("~p: ~p: ensured path '~p'",
+                                          [?MODULE, ?FUNCTION_NAME, Path]);
                           {error, Reason} ->
-                              ?ERROR("failed to create path: " ++ Path ++ ", reason: " ++ Reason)
+                              lager:error("~p: ~p: failed to create path '~p', reason '~p'",
+                                          [?MODULE, ?FUNCTION_NAME, Path, Reason])
                       end
                   end, State#state.file_paths),
 
@@ -279,7 +281,7 @@ init([Metainfo, Start_when_ready]) ->
                    start_when_ready = Start_when_ready,
                    uploaded = 0},
 
-    ?DEBUG("new torrent " ++ Info_hash),
+    lager:debug("~p: ~p: new torrent '~p'", [?MODULE, ?FUNCTION_NAME, Info_hash_str]),
 
     {ok, State, hibernate}.
 
@@ -296,7 +298,7 @@ handle_call({list}, _From, _State) ->
 %% TODO finish me!
 % @doc API for starting a torrent
 % @end
-handle_cast({start}, State) ->
+handle_cast({start, _From}, State) ->
     case State#state.state of
         inactive ->
             % TODO
@@ -314,11 +316,13 @@ handle_cast({start}, State) ->
             lager:error("torrent worker in a broken state: '~p'", [atom_to_list(State#state.state)])
     end,
 
-    {reply, started, New_state};
+    {noreply, New_state, hibernate};
 handle_cast(stop, State) ->
     {stop, normal, State};
-handle_cast(_Request, _State) ->
-    {ok}.
+handle_cast(Request, State) ->
+    lager:warning("~p: ~p: unhandled cast '~p'",
+                  [?MODULE, ?FUNCTION_NAME, Request]),
+    {noreply, State, hibernate}.
 
 handle_info({torrent_w_tracker_announce_loop}, State) ->
     {ok, Announce_ref} = tracker_announce_loop(State),
@@ -400,14 +404,16 @@ handle_info({tracker_announce, Response}, State) ->
 % connection for a receiving peer_worker. Peer might be a tuple with the peer
 % information or 'error'.
 % @end
-handle_info({peer_s_rx_peers, Peer}, State) when is_tuple(Peer) ->
+handle_info({peer_s_rx_peer, Peer}, State) ->
+    lager:info("~p: ~p: peer_s_rx_peer '~p'", [?MODULE, ?FUNCTION_NAME, Peer]),
     {noreply, State, hibernate};
 % @doc Response from the peer server after trying to establish multiple peer
 % connections for multiple receiving peer workers. The response should not
 % contain any 'error', however it might be an empty list if all the peer
 % workers failed to connect to its peer.
 % @end
-handle_info({peer_s_rx_peers, Peers}, State) when is_list(Peers) ->
+handle_info({peer_s_rx_peers, Peers}, State) ->
+    lager:info("~p: ~p: peer_s_rx_peers '~p'", [?MODULE, ?FUNCTION_NAME, Peers]),
     {noreply, State, hibernate};
 
 % @doc A peer worker received a peers bitfield. Store it for the piece

@@ -89,12 +89,12 @@ start_rx_peer(From, Info_hash, {Address, Port}, Own_peer_id) when is_binary(Info
                                                                Port]),
             ok = ?PEER_W:connect(Peer_pid),
 
-            {ID, Address, Port, Info_hash};
+            {ID, {Address, Port}, Info_hash};
         {ok, Peer_pid, Info} ->
             lager:warning("recv unhandled data Info: '~p'", [Info]),
             ok = ?PEER_W:activate(Peer_pid),
 
-            {ID, Address, Port, Info_hash};
+            {ID, {Address, Port}, Info_hash};
         % This is rather unexpected so log it until it is clear when it happens
         {error, Reason_sup} ->
             lager:error("peer_srv failed to spawn a peer_worker (rx), check the peer_sup. reason: '~p'",
@@ -122,7 +122,7 @@ handle_cast({peer_s_add_rx_peer, From, {Info_hash, {Address, Port}}}, State) ->
 
     Ref = start_rx_peer(From, Info_hash, {Address, Port}, State#state.own_peer_id),
 
-    From ! {peer_s_rx_peers, Ref},
+    From ! {peer_s_rx_peer, Ref},
 
     {noreply, State, hibernate};
 
@@ -155,7 +155,9 @@ handle_cast({peer_s_add_rx_peers, From, {Info_hash, Peers}}, State) ->
     ok = ?TORRENT_W:request_peers(From, Nbr_of_failed_peers),
 
     % Send back the list of connected peers
-    From ! {peer_s_rx_peers, Succeeded_peers};
+    From ! {peer_s_rx_peers, Succeeded_peers},
+
+    {noreply, State, hibernate};
 
 % @doc Adding a transmitting peer worker. The socket is already accepted by the
 % peer accept-process. Note: When mentioning the terms receiving and
