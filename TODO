@@ -2,7 +2,6 @@ tODO:
 =======
 
 Questions:
-- Should cache be handled centralized or distributed?
 - If I have a supervision tree a supervisor, supervising second supervisor and
   a gen_server. How would I go about to give, the PID of the second supervisor,
   as an argument to the gen_server?
@@ -10,13 +9,9 @@ Questions:
 - Check out edown if it could be used for documentation?
 
 General:
-- Figure out the piece format of the metainfo
-- Merge the peer_in_sup with the peer_ssup
 - Read up on OS-specifics http://erlang.org/doc/man/os.html#type-0
 - Figure out start up order. settings sup.tree needs to start up first so that
   torrent_ssup can get port settings.
-- Create peer_ssup
-- Create file_ssup
 - Investigate of there should be a sup for hash otherwise rename sup -> ssup
 - Investigate of there should be a sup for tracker otherwise rename sup -> ssup
 - Update ertorrent_sup with new ssups
@@ -56,16 +51,16 @@ tracker_srv:
 - Add incoming peer port
 
 torrent_worker:
+- Figure out how to keep track of assigned pieces and a way to limit duplicated
+  piece assignments (1-3 peers should be able to be assigned to the same piece
+  in case of speed).
 - Figure out the time between tracker announcements from the specification and
   update the value of ANNOUNCE_TIME
 - During "handle_cast({start", request a tracker_worker
 - During "handle_cast({start", create a file_worker
-- Create missing files based on Missing_files
-- Remove port from announce_trigger()
 - Don't serve buffered requests when peer is choked.
 - Decide how to handle buffered requests during the time that the peer is
   choked. Drop all the requests or keep them buffered?
-- What is the compact field in the state record for?
 
 torrent_srv:
 - Iterate and add stored metainfo in init/1, stored metainfo should be read by

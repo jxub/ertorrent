@@ -132,14 +132,14 @@ send_keep_alive(Socket) ->
 blocks_to_piece(Blocks) ->
     Sorted_blocks = lists:keysort(1, Blocks),
 
-    ?INFO("TODO This might work ..."),
+    lager:debug("TODO This might work ..."),
     Blocks_tmp = lists:foldl(fun({_Idx, Data}, Total) ->
                                 [Data| Total]
                              end, [], Sorted_blocks),
 
     Blocks_list = lists:reverse(Blocks_tmp),
 
-    ?INFO("Converting list to binary"),
+    lager:debug("Converting list to binary"),
     list_to_binary(Blocks_list).
 
 % Call peer_srv to forward a finished piece to the file_srv and prepare a state
@@ -166,6 +166,155 @@ complete_piece(State) ->
                             incoming_piece_total_size = New_piece_total_size,
                             incoming_piece_hash = New_piece_hash},
 
+    {ok, New_state}.
+
+handle_bitfield(Bitfield, State) ->
+    {ok, Bf_list} = ?BINARY:bitfield_to_list(Bitfield),
+    lager:info("~p: ~p: peer '~p' received bitfield: '~p', list: '~p'",
+               [?MODULE, ?FUNCTION_NAME, State#state.id, Bitfield, Bf_list]),
+
+    State#state.torrent_pid ! {peer_w_bitfield, State#state.id, Bitfield},
+
+    {ok, State}.
+
+handle_have(Piece_idx, State) ->
+    lager:debug("~p: HAVE, piece index: '~p'", [?FUNCTION_NAME, Piece_idx]),
+
+    New_bitfield = ?BINARY:set_bit(Piece_idx, 1, State#state.peer_bitfield),
+
+    State#state.peer_srv_pid ! {peer_w_bitfield_update, New_bitfield},
+    % TODO if we're sending a piece that is announced in a HAVE message, should
+    % we cancel the tranmission or ignore it and wait for a CANCEL message?
+
+    % Removing the cached piece
+    Outgoing_pieces = lists:keydelete(Piece_idx, 1, State#state.outgoing_piece_queue),
+
+    New_state = State#state{outgoing_piece_queue = Outgoing_pieces,
+                            peer_bitfield = New_bitfield},
+
+    {ok, New_state}.
+handle_request(Index, Begin, Length, State) ->
+    lager:debug("~p: REQUEST, index: '~p', begin: '~p', length: '~p'",
+                [?FUNCTION_NAME, Index, Begin, Length]),
+
+    case lists:keyfind(Index, 1, State#state.outgoing_piece_queue) of
+        {Index, _Hash, Data} ->
+            <<Begin, Block:Length, _Rest/binary>> = Data,
+
+            Msg = ?PEER_PROTOCOL:msg_piece(Length, Index, Begin, Block),
+
+            % TODO figure out a smart way to detect when we can clear out
+            % cached pieces
+            case gen_tcp:send(State#state.socket, Msg) of
+                {error, Reason} ->
+                    lager:warning("~p: ~p: failed to send a REQUEST response: '~p'",
+                                  [?MODULE, ?FUNCTION_NAME, Reason])
+            end,
+
+            New_state = State;
+        false ->
+            % If the requested piece ain't buffered, send a request to read the
+            % piece form disk and meanwhile buffer the request.
+            Request_buffer = [{request, Index, Begin, Length}|
+                              State#state.request_buffer],
+
+            State#state.peer_srv_pid ! {peer_w_piece_req, self(), Index},
+
+            New_state = State#state{request_buffer=Request_buffer}
+    end,
+
+    {ok, New_state}.
+handle_piece(Index, Begin, Data, State) ->
+    % Check that the piece is requested
+    case Index == State#state.incoming_piece_index of
+        true ->
+            Size = State#state.incoming_piece_downloaded_size + binary:referenced_byte_size(Data),
+
+            case Size of
+                % If the size is smaller then the total expected amount, keep building the piece
+                Size when Size < State#state.incoming_piece_total_size ->
+                    New_blocks = [{Begin, Data}| State#state.incoming_piece_blocks],
+                    New_size = Size,
+
+                    New_state = State#state{incoming_piece_blocks = New_blocks,
+                                            incoming_piece_downloaded_size = New_size};
+                % If it's the expected size, complete the piece
+                Size when Size == State#state.incoming_piece_total_size ->
+                    {ok, New_state} = complete_piece(State);
+                % If the size exceeds the expected size, something has gone terribly wrong
+                Size when Size > State#state.incoming_piece_total_size ->
+                    ?ERROR("Size of the piece is larger than it is supposed to. Discarding blocks"),
+                    New_state = State
+            end;
+        false ->
+            ?WARNING("Received blocks belonging to another piece"),
+            New_state = State
+    end,
+    {ok, New_state}.
+
+% TODO determine if we should clear the request buffer when receiving choked?
+% According to http://jonas.nitro.dk/bittorrent/bittorrent-rfc.txt
+% "If a peer chokes a remote peer, it MUST also discard any unanswered
+% requests for blocks previously received from the remote peer."
+handle_choke(State) ->
+    % Inform the other subsystems that this peer is choked
+    % TODO I am adding this for the future if we want to display this in any way
+    State#state.peer_srv_pid ! {peer_w_choke, State#state.id},
+
+    % Updating the peer state and clearing the request buffer
+    New_state = State#state{peer_choked = true,
+                            request_buffer = []},
+
+    {ok, New_state}.
+handle_unchoke(State) ->
+    State#state.peer_srv_pid ! {peer_w_unchoke, State#state.id},
+
+    % Updating the peer state
+    New_state = State#state{peer_choked = false},
+
+    {ok, New_state}.
+handle_interested(State) ->
+    State#state.peer_srv_pid ! {peer_w_interested, State#state.id},
+
+    % Updating the peer state
+    New_state = State#state{peer_interested = true},
+
+    {ok, New_state}.
+% TODO figure out how to handle not interested
+handle_not_interested(State) ->
+    State#state.peer_srv_pid ! {peer_w_not_interested, State#state.id},
+
+    % Updating the peer state
+    New_state = State#state{peer_interested = false},
+
+    {ok, New_state}.
+handle_cancel(Index, Begin, Length, State) ->
+    % Remove the buffered request and possible duplicates
+    New_buffered_requests = lists:filter(
+                                fun(X) ->
+                                    case X of
+                                        {request, Index, Begin, Length} -> false;
+                                        _ -> true
+                                    end
+                                end,
+                                State#state.request_buffer
+                            ),
+
+    % Check if there's any remaining requests for the same piece, otherwise
+    % remove the piece from the cache.
+    case lists:keyfind(Index, 2, New_buffered_requests) of
+        false ->
+            New_tx_pieces = lists:keydelete(Index, 1,
+                                            State#state.outgoing_piece_queue);
+        _ -> New_tx_pieces = State#state.outgoing_piece_queue
+    end,
+
+    New_state = State#state{request_buffer = New_buffered_requests,
+                            outgoing_piece_queue = New_tx_pieces},
+
+    {ok, New_state}.
+handle_port(Port, State) ->
+    New_state = State#state{dht_port = Port},
     {ok, New_state}.
 
 %%% Callback module
@@ -253,7 +402,7 @@ handle_cast(peer_w_connect, State) ->
                      hibernate};
                 {error, Reason} ->
                     lager:debug("~p: ~p: failed send handshake, reason: '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
-                    {stop, {error_handshake, Reason}}
+                    {stop, normal, State}
             end;
         {error, Reason_connect} ->
             lager:debug("~p: ~p: peer_srv failed to establish connection with peer address: '~p', port: '~p', reason: '~p'",
@@ -263,7 +412,7 @@ handle_cast(peer_w_connect, State) ->
                          State#state.port,
                          Reason_connect]),
 
-            error
+            {stop, normal, State}
     end;
 handle_cast(stop, State) ->
     {stop, normal, State};
@@ -351,147 +500,62 @@ handle_info({tcp, _S, <<>>}, State) ->
     New_state = State#state{keep_alive_rx_ref=New_keep_alive_rx_ref},
 
     {noreply, New_state, hibernate};
-handle_info({tcp, _S, <<?HAVE, Piece_idx:32/big-integer>>}, State) ->
-    lager:debug("~p: HAVE, piece index: '~p'", [?FUNCTION_NAME, Piece_idx]),
-
-    New_bitfield = ?BINARY:set_bit(Piece_idx, 1, State#state.peer_bitfield),
-
-    State#state.peer_srv_pid ! {peer_w_bitfield_update, New_bitfield},
-    % TODO if we're sending a piece that is announced in a HAVE message, should
-    % we cancel the tranmission or ignore it and wait for a CANCEL message?
-
-    % Removing the cached piece
-    Outgoing_pieces = lists:keydelete(Piece_idx, 1, State#state.outgoing_piece_queue),
-
-    New_state = State#state{outgoing_piece_queue = Outgoing_pieces,
-                            peer_bitfield = New_bitfield},
-
-    {noreply, New_state, hibernate};
-handle_info({tcp, _S, <<?REQUEST, Index:32/big, Begin:32/big, Length:32/big>>}, State) ->
-    lager:debug("~p: REQUEST, index: '~p', begin: '~p', length: '~p'",
-                [?FUNCTION_NAME, Index, Begin, Length]),
-
-    case lists:keyfind(Index, 1, State#state.outgoing_piece_queue) of
-        {Index, _Hash, Data} ->
-            <<Begin, Block:Length, _Rest/binary>> = Data,
-
-            Msg = ?PEER_PROTOCOL:msg_piece(Length, Index, Begin, Block),
-
-            % TODO figure out a smart way to detect when we can clear out
-            % cached pieces
-            case gen_tcp:send(State#state.socket, Msg) of
-                {error, Reason} ->
-                    lager:warning("~p: ~p: failed to send a REQUEST response: '~p'",
-                                  [?MODULE, ?FUNCTION_NAME, Reason])
-            end,
-
-            New_state = State;
-        false ->
-            % If the requested piece ain't buffered, send a request to read the
-            % piece form disk and meanwhile buffer the request.
-            Request_buffer = [{request, Index, Begin, Length}|
-                              State#state.request_buffer],
-
-            State#state.peer_srv_pid ! {peer_w_piece_req, self(), Index},
-
-            New_state = State#state{request_buffer=Request_buffer}
-    end,
-
-    {noreply, New_state, hibernate};
-handle_info({tcp, _S, <<?PIECE, Index:32/big-integer, Begin:32/big-integer,
-                        Data/binary>>}, State) ->
-    lager:debug("~p: PIECE, index: '~p', begin: '~p'", [?FUNCTION_NAME, Index, Begin]),
-
-    % Check that the piece is requested
-    case Index == State#state.incoming_piece_index of
-        true ->
-            Size = State#state.incoming_piece_downloaded_size + binary:referenced_byte_size(Data),
-
-            case Size of
-                % If the size is smaller then the total expected amount, keep building the piece
-                Size when Size < State#state.incoming_piece_total_size ->
-                    New_blocks = [{Begin, Data}| State#state.incoming_piece_blocks],
-                    New_size = Size,
-
-                    New_state = State#state{incoming_piece_blocks = New_blocks,
-                                            incoming_piece_downloaded_size = New_size};
-                % If it's the expected size, complete the piece
-                Size when Size == State#state.incoming_piece_total_size ->
-                    {ok, New_state} = complete_piece(State);
-                % If the size exceeds the expected size, something has gone terribly wrong
-                Size when Size > State#state.incoming_piece_total_size ->
-                    ?ERROR("Size of the piece is larger than it is supposed to. Discarding blocks"),
-                    New_state = State
-            end;
-        false ->
-            ?WARNING("Received blocks belonging to another piece"),
+handle_info({tcp, _S, <<Length:32/big-integer,
+                        Message_id:8/big-integer,
+                        Rest/binary>>}, State) ->
+    % TODO change to one convertion of message id
+    lager:debug("~p: ~p: length '~p', id '~p'",
+                [?MODULE,
+                 ?FUNCTION_NAME,
+                 Length,
+                 Message_id]),
+    % Sorted by assumed frequency
+    % TODO meassure the frequency to determine if the is correctly assumed or
+    % if this will be causing issues (possible inefficient matching)
+    case Message_id of
+        ?REQUEST ->
+            lager:debug("~p: ~p: message request", [?MODULE, ?FUNCTION_NAME]),
+            <<Index:32/big, Begin:32/big, Length:32/big>> = Rest,
+            lager:debug("index '~p', begin '~p', length '~p'", [Index, Begin, Length]),
+            {ok, New_state} = handle_request(Index, Begin, Length, State);
+        ?PIECE ->
+            lager:debug("~p: ~p: message piece", [?MODULE, ?FUNCTION_NAME]),
+            <<Index:32/big-integer, Begin:32/big-integer, Data/binary>> = Rest,
+            {ok, New_state} = handle_piece(Index, Begin, Data, State);
+        ?HAVE ->
+            lager:debug("~p: ~p: message have", [?MODULE, ?FUNCTION_NAME]),
+            <<Piece_index:32/big-integer>> = Rest,
+            {ok, New_state} = handle_have(Piece_index, State);
+        ?CANCEL ->
+            lager:debug("~p: ~p: message cancel", [?MODULE, ?FUNCTION_NAME]),
+            <<Index:32/big, Begin:32/big, Length:32/big>> = Rest,
+            {ok, New_state} = handle_cancel(Index, Begin, Length, State);
+        ?CHOKE ->
+            lager:debug("~p: ~p: message choke", [?MODULE, ?FUNCTION_NAME]),
+            {ok, New_state} = handle_choke(State);
+        ?UNCHOKE ->
+            lager:debug("~p: ~p: message uncoke", [?MODULE, ?FUNCTION_NAME]),
+            {ok, New_state} = handle_unchoke(State);
+        ?INTERESTED ->
+            lager:debug("~p: ~p: message interested", [?MODULE, ?FUNCTION_NAME]),
+            {ok, New_state} = handle_interested(State);
+        ?NOT_INTERESTED ->
+            lager:debug("~p: ~p: message not interested", [?MODULE, ?FUNCTION_NAME]),
+            {ok, New_state} = handle_not_interested(State);
+        ?BITFIELD ->
+            lager:debug("~p: ~p: message bitfield", [?MODULE, ?FUNCTION_NAME]),
+            <<Bitfield/binary>> = Rest,
+            {ok, New_state} = handle_bitfield(Bitfield, State);
+        ?PORT ->
+            lager:debug("~p: ~p: message port", [?MODULE, ?FUNCTION_NAME]),
+            <<Port:16/big>> = Rest,
+            {ok, New_state} = handle_port(Port, State);
+        _ ->
+            lager:debug("~p: ~p: unhandled message id '~p'",
+                        [?MODULE, ?FUNCTION_NAME, Message_id]),
             New_state = State
     end,
-
-    {noreply, New_state};
-
-% TODO determine if we should clear the request buffer when receiving choked?
-% According to http://jonas.nitro.dk/bittorrent/bittorrent-rfc.txt
-% "If a peer chokes a remote peer, it MUST also discard any unanswered
-% requests for blocks previously received from the remote peer."
-handle_info({tcp, _S, <<?CHOKE>>}, State) ->
-    % Inform the other subsystems that this peer is choked
-    % TODO I am adding this for the future if we want to display this in any way
-    State#state.peer_srv_pid ! {peer_w_choke, State#state.id},
-
-    % Updating the peer state and clearing the request buffer
-    New_state = State#state{peer_choked = true,
-                            request_buffer = []},
-
-    {noreply, New_state};
-handle_info({tcp, _S, <<?UNCHOKE>>}, State) ->
-    State#state.peer_srv_pid ! {peer_w_unchoke, State#state.id},
-
-    % Updating the peer state
-    New_state = State#state{peer_choked = false},
-
-    {noreply, New_state};
-handle_info({tcp, _S, <<?INTERESTED>>}, State) ->
-    State#state.peer_srv_pid ! {peer_w_interested, State#state.id},
-
-    % Updating the peer state
-    New_state = State#state{peer_interested = true},
-
-    {noreply, New_state};
-% TODO figure out how to handle not interested
-handle_info({tcp, _S, <<?NOT_INTERESTED>>}, State) ->
-    State#state.peer_srv_pid ! {peer_w_not_interested, State#state.id},
-
-    % Updating the peer state
-    New_state = State#state{peer_interested = false},
-
-    {noreply, New_state};
-handle_info({tcp, _S, <<?CANCEL, Index:32/big, Begin:32/big, Len:32/big>>},
-            State) ->
-    % Remove the buffered request and possible duplicates
-    New_buffered_requests = lists:filter(
-                                fun(X) ->
-                                    case X of
-                                        {request, Index, Begin, Len} -> false;
-                                        _ -> true
-                                    end
-                                end,
-                                State#state.request_buffer
-                            ),
-
-    % Check if there's any remaining requests for the same piece, otherwise
-    % remove the piece from the cache.
-    case lists:keyfind(Index, 2, New_buffered_requests) of
-        false ->
-            New_tx_pieces = lists:keydelete(Index, 1,
-                                            State#state.outgoing_piece_queue);
-        _ -> New_tx_pieces = State#state.outgoing_piece_queue
-    end,
-
-    New_state = State#state{request_buffer = New_buffered_requests,
-                            outgoing_piece_queue = New_tx_pieces},
-
-    {noreply, New_state};
+    {noreply, New_state, hibernate};
 handle_info({tcp, _S, <<19/integer,
                         "BitTorrent protocol",
                         Flags:8/bytes,
@@ -522,23 +586,14 @@ handle_info({tcp, _S, <<19/integer,
             {stop, "invalid handshake", State}
     end;
 
-handle_info({tcp, _S, <<?BITFIELD, Bitfield/binary>>}, State) ->
-    lager:info("~p: ~p: peer '~p' received bitfield: '~p'",
-               [?MODULE, ?FUNCTION_NAME, State#state.id, Bitfield]),
-
-    State#state.peer_srv_pid ! {peer_w_bitfield, Bitfield},
-
-    {noreply, State};
-handle_info({tcp, _S, <<?PORT, Port:16/big>>}, State) ->
-    New_state = State#state{dht_port = Port},
-    {noreply, New_state};
 handle_info({tcp_closed, _S}, State) ->
-    {stop, peer_connection_closed, State};
+    lager:debug("~p: ~p: peer closed the conncetion", [?MODULE, ?FUNCTION_NAME]),
+    {stop, normal, State};
 handle_info({tcp, _S, Message}, State) ->
     lager:warning("~p: ~p: peer '~p' received an unhandled tcp message: '~p'",
                   [?MODULE, ?FUNCTION_NAME, State#state.id, Message]),
-    {stop, peer_unhandled_message, State}.
+    {stop, normal, State};
 handle_info(Message, State) ->
     lager:warning("~p: ~p: peer '~p' received an unhandled message: '~p'",
                   [?MODULE, ?FUNCTION_NAME, State#state.id, Message]),
-    {stop, peer_unhandled_message, State}.
+    {stop, normal, State}.

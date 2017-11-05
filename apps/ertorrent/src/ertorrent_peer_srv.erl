@@ -151,8 +151,14 @@ handle_cast({peer_s_add_rx_peers, From, {Info_hash, Peers}}, State) ->
     % Count the amount of failed peer workers
     Nbr_of_failed_peers = length(Peers) - length(Succeeded_peers),
 
-    % Request new peers corresponding to the amount of the failed peers
-    ok = ?TORRENT_W:request_peers(From, Nbr_of_failed_peers),
+    case Nbr_of_failed_peers > 0 of
+        true ->
+            % Request new peers corresponding to the amount of the failed peers
+            ok = ?TORRENT_W:request_peers(From, Nbr_of_failed_peers);
+        false ->
+            lager:debug("~p: ~p: reached expected amount of running peers",
+                        [?MODULE, ?FUNCTION_NAME])
+    end,
 
     % Send back the list of connected peers
     From ! {peer_s_rx_peers, Succeeded_peers},

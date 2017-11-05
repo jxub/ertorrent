@@ -49,7 +49,7 @@
 % hash_files_resp
 % USER INPUT
 % tracker_announce
-% add_rx_peer
+% add_rx_peers
 
 %% @doc Type to represent the internal state of a torrent worker
 %% @initializing == before hashing is completed
@@ -86,7 +86,7 @@
                 length::integer(), % Total length of the torrent contents
                 locations::list(),
                 metainfo,
-                peers::list(),
+                peers::list(), % Not contacted peers from the last tracker announcement
                 peer_id::string(), % Our unique peer id e.g. ER-1-0-0-<sha1>
                 peer_listen_port::integer(),
                 peers_max::integer(), % The maximum amount of peers this torrent is allowed to have
@@ -117,7 +117,7 @@ deactivate(Torrent_w_id) ->
     gen_server:cast(Torrent_w_id, {deactivate}).
 
 request_peers(Torrent_w_id, Amount_of_peers) ->
-    gen_server:cast(Torrent_w_id, {torrent_w_request_peers, self(), Amount_of_peers}).
+    gen_server:cast(Torrent_w_id, {torrent_w_request_peers, Amount_of_peers}).
 
 % Starting server
 start_link(ID, Args) ->
@@ -142,6 +142,14 @@ stop(Name) when is_atom(Name) ->
 % @doc Timer function for when to perform tracker announcements
 % @end
 tracker_announce_loop(State) ->
+    case is_reference(State#state.announce_ref) of
+        true ->
+            erlang:cancel_timer(announce_ref);
+        _ ->
+            lager:debug("~p: ~p: no timer to cancel",
+                        [?MODULE, ?FUNCTION_NAME])
+    end,
+
     % TODO make this async
     {ok, Response} = ?TRACKER:announce2(State#state.announce,
                                         State#state.info_hash_str,
@@ -162,7 +170,7 @@ tracker_announce_loop(State) ->
 
             self() ! {tracker_announce, Response};
         {error, no_match} ->
-            lager:error("invalid tracker response (missing interval)"),
+            lager:warning("invalid tracker response (missing interval)"),
 
             % Send message to tracker.
             Ref = erlang:send_after(?ANNOUNCE_TIME*1000, self(), {torrent_w_tracker_announce_loop})
@@ -294,6 +302,42 @@ handle_call({list}, _From, _State) ->
     io:format("~p list~n",[?MODULE]),
     {ok}.
 
+% Request from the peer_s when it needs more peers to reach the planned
+% amount of peers.
+handle_cast({torrent_w_request_peers, Peer_amount}, State) ->
+    lager:debug("~p: ~p: torrent_w_request_peers, amount '~p'",
+                [?MODULE, ?FUNCTION_NAME, Peer_amount]),
+
+    lager:debug("LENGTH PEERS '~p'", [length(State#state.peers)]),
+
+    % Check if the current list of potential peers is sufficient otherwise make
+    % a new announcement to request more peers.
+    case length(State#state.peers) < Peer_amount of
+        false ->
+            % Create a list, equal to the amount of missing peers, to activate
+            {Peers_activate, Peers_rest} = lists:split(Peer_amount,
+                                                       State#state.peers),
+
+            lager:debug("~p: ~p: refilling peers '~p'",
+                        [?MODULE, ?FUNCTION_NAME, Peers_activate]),
+
+            % Tell the peer_s to start the peers
+            ?PEER_SRV:add_rx_peers(State#state.info_hash_bin, Peers_activate),
+
+            New_state = State#state{peers_cur = State#state.peers_max,
+                                    peers = Peers_rest};
+        true ->
+            % Re-schedule the announce earlier, to get more peers. Updating the
+            % peer counter and letting the announce loop do it's jobs.
+            {ok, Ref} = tracker_announce_loop(State),
+
+            Current_peers = State#state.peers_max - Peer_amount,
+
+            New_state = State#state{announce_ref = Ref,
+                                    peers_cur = Current_peers}
+    end,
+
+    {noreply, New_state, hibernate};
 %% User input that should change the torrent state from inactive to active
 %% TODO finish me!
 % @doc API for starting a torrent
@@ -386,7 +430,7 @@ handle_info({tracker_announce, Response}, State) ->
 
             lager:debug("peers: ~p", [Peer_list]),
 
-            % Tell the torrent_s to start the peers
+            % Tell the peer_s to start the peers
             ?PEER_SRV:add_rx_peers(State#state.info_hash_bin, Peers_activate);
         false ->
             lager:warning("nothing to do here"),
@@ -473,7 +517,10 @@ handle_info({file_w_write_offset_res, _From, {_Info_hash, _Piece_idx}}, State) -
 % @doc A peer worker terminated. Figure out which peer to connect to and fire
 % up a new peer worker if it's necessary.
 % @end
+% TODO This should probably be moved to peer_s
 handle_info({peer_w_terminate, ID, _Current_piece_index}, State) ->
+    lager:debug("~p: ~p: peer_w_terminate", [?MODULE, ?FUNCTION_NAME]),
+
     case State#state.bitfields /= undefined of
         true ->
             % Remove the peer_w's bitfield
@@ -489,7 +536,7 @@ handle_info({peer_w_terminate, ID, _Current_piece_index}, State) ->
     % Add the assigned piece index to the list again if it wasn't finished
 
     % Fire up a new peer_w
-
+    ok = request_peers(self(), 1),
 
     {noreply, New_state, hibernate};
 
