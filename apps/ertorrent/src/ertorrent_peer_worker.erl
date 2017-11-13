@@ -317,6 +317,14 @@ handle_port(Port, State) ->
     New_state = State#state{dht_port = Port},
     {ok, New_state}.
 
+parse_peer_flags(Flags_bin) ->
+    lager:debug("~p: ~p: parse_peer_flags", [?MODULE, ?FUNCTION_NAME]),
+
+    Fast_extension = 16#4 band Flags_bin == 16#04,
+
+    Flags = [{fast_extension, Fast_extension}],
+    {ok, Flags}.
+
 %%% Callback module
 init([ID, Info_hash, Peer_id, {Address, Port}, Torrent_pid]) when is_integer(ID)
                                                              andalso is_binary(Info_hash) ->
@@ -550,6 +558,22 @@ handle_info({tcp, _S, <<Length:32/big-integer,
             lager:debug("~p: ~p: message port", [?MODULE, ?FUNCTION_NAME]),
             <<Port:16/big>> = Rest,
             {ok, New_state} = handle_port(Port, State);
+        % FAST EXTENSION
+        ?SUGGEST_PIECE ->
+            lager:debug("~p: ~p: message suggest piece", [?MODULE, ?FUNCTION_NAME]),
+            New_state = State;
+        ?HAVE_ALL ->
+            lager:debug("~p: ~p: message have all", [?MODULE, ?FUNCTION_NAME]),
+            New_state = State;
+        ?HAVE_NONE ->
+            lager:debug("~p: ~p: message have none", [?MODULE, ?FUNCTION_NAME]),
+            New_state = State;
+        ?REJECT_PIECE ->
+            lager:debug("~p: ~p: message reject piece", [?MODULE, ?FUNCTION_NAME]),
+            New_state = State;
+        ?ALLOWED_FAST ->
+            lager:debug("~p: ~p: message allowed fast", [?MODULE, ?FUNCTION_NAME]),
+            New_state = State;
         _ ->
             lager:debug("~p: ~p: unhandled message id '~p'",
                         [?MODULE, ?FUNCTION_NAME, Message_id]),
@@ -558,7 +582,7 @@ handle_info({tcp, _S, <<Length:32/big-integer,
     {noreply, New_state, hibernate};
 handle_info({tcp, _S, <<19/integer,
                         "BitTorrent protocol",
-                        Flags:8/bytes,
+                        Flags_bin:8/bytes,
                         Info_hash:20/bytes,
                         Peer_id/bytes>>}, % Put the rest of the message into peer id, seen cases where this is 25 bytes and should be 20 bytes
              State)  ->
@@ -566,10 +590,13 @@ handle_info({tcp, _S, <<19/integer,
                 [
                  ?MODULE,
                  ?FUNCTION_NAME,
-                 Flags,
+                 Flags_bin,
                  binary_to_list(Info_hash),
                  binary_to_list(Peer_id)
                 ]),
+
+    {ok, Flags} = parse_peer_flags(Flags_bin),
+    lager:debug("~p: ~p: peer flags '~p'", [?MODULE, ?FUNCTION_NAME, Flags]),
 
     % TODO add validation of Peer_id
     case State#state.torrent_info_hash_bin == Info_hash of

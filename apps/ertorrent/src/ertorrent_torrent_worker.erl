@@ -92,7 +92,7 @@
                 peers_max::integer(), % The maximum amount of peers this torrent is allowed to have
                 peers_cur::integer(), % Current number of active peers
                 pieces::list(), % Piece hashes from the metainfo
-                piece_layout::list(), % A translation between piece index and file offset, e.g. [{Piece_idx, File_path, File_offset, Length}]
+                pieces_distributed::list(), % Bookkeeping of distributed pieces and number of times it is currently distributed, e.g. [{Piece_index, Distribute_counter}]
                 state:: initializing | active | inactive,
                 start_when_ready::boolean(), % TODO use this, if the torrent should start regardless of user input. Should also be used if you want to activate the torrent whenever the torrent is shifting state from initializing to inactive.
                 stats_leechers::integer(), % Stats from the tracker that might be of interest
@@ -221,15 +221,16 @@ init([Metainfo, Start_when_ready]) ->
     {ok, Info_hash_str} = ?UTILS:hash_digest_to_string(Info_encoded),
 
     {ok, Announce_address} = ?METAINFO:get_value(<<"announce">>, Metainfo),
-    {ok, Piece_length} = ?METAINFO:get_value(<<"piece length">>, Info),
+    {ok, Piece_max_length} = ?METAINFO:get_value(<<"piece length">>, Info),
     % Prepare a list of pieces since, the piece section of the metainfo
     % consists of a concatenated binary of all the pieces.
     {ok, Pieces_bin} = ?METAINFO:get_value(<<"pieces">>, Info),
 
     Resolved_files = ?METAINFO:resolve_files(Metainfo),
 
-    {ok, Pieces} = ?UTILS:pieces_binary_to_list(Pieces_bin),
-    Length = length(Pieces) * Piece_length,
+    {ok, Piece_hashes} = ?UTILS:pieces_binary_to_list(Pieces_bin),
+    % TODO check if the calculated length match the one in the meta info
+    Length = length(Piece_hashes) * Piece_max_length,
 
     % URI encoded peer id
     {peer_id_uri, Peer_id_encoded} = ?SETTINGS_SRV:get_sync(peer_id_uri),
@@ -261,13 +262,20 @@ init([Metainfo, Start_when_ready]) ->
 
     % Calculate the piece layout over the file structure
     % TODO rename create_file_mapping
-    {ok, Piece_layout} = ?UTILS:create_file_mapping(Resolved_files, Piece_length),
+    {ok, Piece_layout} = ?UTILS:create_file_mapping(Resolved_files, Piece_max_length),
+
+    % Create a list with all the piece related information
+    Pieces = lists:zipwith(fun(Piece_hash, {Piece_idx,
+                                            File_path,
+                                            File_offset,
+                                            Piece_length}) ->
+                               {Piece_idx, Piece_hash, File_path, File_offset,
+                                Piece_length}
+                           end, Piece_hashes, Piece_layout),
 
     % THIS SHOULD BE THE END OF THE INITIALIZATION
     % hash_files is an async call and we should be ready to serve when we
     % receive its response.
-    % TODO possible race condition?
-    %?HASH_SRV:hash_files(self(), File_paths, Piece_length),
     ?HASH_SRV:hash_files(Piece_layout),
 
     State = #state{announce = Announce_address,
@@ -285,7 +293,7 @@ init([Metainfo, Start_when_ready]) ->
                    peers_cur = 0,
                    peers_max = 10,
                    pieces = Pieces,
-                   piece_layout = Piece_layout,
+                   pieces_distributed = [],
                    start_when_ready = Start_when_ready,
                    uploaded = 0},
 
@@ -495,11 +503,12 @@ handle_info({peer_w_rx_piece_req, _ID, _Piece_idx, _Piece_data}, State) ->
 % to the file worker.
 % @end
 handle_info({peer_w_tx_piece_req, From, {Piece_index}}, State) ->
-    case lists:keyfind(Piece_index, 1, State#state.piece_layout) of
-        {Piece_index, File, Offset, Length} ->
-            State#state.file_worker ! {torrent_w_read_offset_req, {{From, Piece_index}, File, Offset, Length}};
+    case lists:keyfind(Piece_index, 1, State#state.pieces) of
+        {Piece_index, _Piece_hash, File, Offset, Length} ->
+            State#state.file_worker ! {torrent_w_read_offset_req, From, {Piece_index, File, Offset, Length}};
         false ->
-            ?WARNING("failed to lookup file offset for piece index: " ++ Piece_index)
+            lager:warning("~p: ~p: failed to lookup file offset for piece index: '~p'",
+                          [?MODULE, ?FUNCTION_NAME, Piece_index])
     end,
     {noreply, State};
 
