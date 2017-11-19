@@ -31,7 +31,6 @@
 
 -define(SETTINGS_SRV, ertorrent_settings_srv).
 -define(PEER_SUP, ertorrent_peer_sup).
--define(PEER_SSUP, ertorrent_peer_ssup).
 -define(PEER_W, ertorrent_peer_worker).
 -define(TORRENT_SRV, ertorrent_torrent_srv).
 -define(TORRENT_W, ertorrent_torrent_worker).
@@ -75,7 +74,7 @@ stop() ->
 %%% Internal functions
 start_rx_peer(From, Info_hash, {Address, Port}, Own_peer_id) when is_binary(Info_hash) ->
     ID = erlang:unique_integer(),
-    Ret = ?PEER_SUP:start_child(ID, Info_hash, Own_peer_id, {Address, Port}, From),
+    Ret = ?PEER_SUP:start_child(ID, rx, Info_hash, Own_peer_id, {Address, Port}, From),
 
     case Ret of
         % TODO Atm the handling of the {ok, _} responses is redundant.
@@ -99,11 +98,6 @@ start_rx_peer(From, Info_hash, {Address, Port}, Own_peer_id) when is_binary(Info
         {error, Reason_sup} ->
             lager:error("peer_srv failed to spawn a peer_worker (rx), check the peer_sup. reason: '~p'",
                         [Reason_sup]),
-
-            % TODO if there's an issue with the peer_sup being
-            % unresponsive. An alternative could be to message the
-            % peer_ssup to restart the sup. For now it will only be
-            % logged.
 
             error
     end.
@@ -170,7 +164,7 @@ handle_cast({peer_s_add_rx_peers, From, {Info_hash, Peers}}, State) ->
 % transmitting, about peers, it refers to the function of the peer worker
 % process and not the actual peer on the other side of the wire.
 % @end
-handle_cast({add_tx_peer, {Socket, Info_hash}}, State) ->
+handle_cast({add_tx_peer, From, {Socket, Info_hash}}, State) ->
     ID = erlang:unique_integer(),
 
     % Retreive the address and port from the socket
@@ -179,8 +173,8 @@ handle_cast({add_tx_peer, {Socket, Info_hash}}, State) ->
             Address = S_address,
             Port = S_port;
         {error, Reason_peername} ->
-            ?WARNING("failed to retreive address and port form peer_tx socket: "
-                     ++ Reason_peername),
+            lager:warning("~p:~p: failed to retreive address and port form tx peer's socket: '~p'",
+                          [?MODULE, ?FUNCTION_NAME, Reason_peername]),
 
             % Set fail-over values for Address and Port, these values are
             % mainly for information so should not be vital.
@@ -193,12 +187,9 @@ handle_cast({add_tx_peer, {Socket, Info_hash}}, State) ->
     % Validate the Info_hash
     case ?TORRENT_SRV:member_by_info_hash(Info_hash) of
         true ->
-            case supervisor:start_child(?PEER_SUP,
-                                         [ID,
-                                          [ID,
-                                           Info_hash,
-                                           State#state.own_peer_id,
-                                           Socket]]) of
+            case ?PEER_SUP:start_child(ID, tx, Info_hash,
+                                       State#state.own_peer_id,
+                                       {socket, Socket}, From) of
                 {ok, Peer_pid} ->
                     New_state = State#state{peers=[{ID,
                                                     Peer_pid,
@@ -212,13 +203,8 @@ handle_cast({add_tx_peer, {Socket, Info_hash}}, State) ->
                                                     Port,
                                                     Info_hash}| Peers]};
                 {error, Reason_sup} ->
-                    ?ERROR("peer_srv failed to spawn a peer_worker (rx), check the peer_sup. reason: "
-                           ++ Reason_sup),
-
-                    % TODO if there's an issue with the peer_sup being
-                    % unresponsive. An alternative could be to message the
-                    % peer_ssup to restart the sup. For now it will only be
-                    % logged.
+                    lager:error("~p:~p: failed to spawn a peer_worker (tx), check the peer_sup. reason: '~p'",
+                                 [?MODULE, ?FUNCTION_NAME, Reason_sup]),
 
                     New_state = State
             end;

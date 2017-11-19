@@ -1,12 +1,15 @@
 -module(ertorrent_utils).
 
--export([index_list/1,
+-export([
+         index_list/1,
+         block_offsets/2,
          create_file_mapping/2,
          read_term_from_file/1,
          write_term_to_file/2,
          hash_digest_to_string/1,
          percent_encode/1,
-         pieces_binary_to_list/1]).
+         pieces_binary_to_list/1
+        ]).
 
 -ifdef(EUNIT).
 -include_lib("eunit/include/eunit.hrl").
@@ -30,7 +33,9 @@
 %    {ok, Fd} = file:open(Dir ++ '/' ++ Name),
 %    file:close(Fd).
 
-
+% Some metainfo contains hash sums in the file list. This function will filter
+% out potential hash values for the functions that won't take the hash into
+% consideration.
 unify_file_list(File_paths) ->
     % Unify the tuple list of files and file sizes
     Result = lists:foldl(fun(FileTuple, Acc) ->
@@ -43,6 +48,33 @@ unify_file_list(File_paths) ->
                          end, [], File_paths),
 
     {ok, lists:reverse(Result)}.
+
+block_offsets(Block_size, Piece_size) ->
+    % 0 will be included so remove one to keep the actual amount
+    Whole_blocks = lists:seq(0, Piece_size, Block_size),
+
+    % Create a tuple list with the block offset and the block length
+    Map = fun(Block_offset) ->
+              {Block_offset, Block_size}
+          end,
+    Block_length = lists:map(Map, Whole_blocks),
+
+    % Figure out if there's a trailing block
+    case Piece_size rem Block_size of
+        0 ->
+            Block_offsets = Block_length;
+        Rem_size ->
+            % The trailing block is after the last whole block
+            {Last_offset, Last_length} = lists:last(Block_length),
+
+            Rem_offset = Last_offset * Last_length,
+            Rem_list = [{Rem_offset, Rem_size}],
+
+            % Add the trailing block to the whole block offsets
+            Block_offsets = Block_length ++ Rem_list
+    end,
+
+    {ok, Block_offsets}.
 
 % The peer wire protocol is referring to piece index. This is the total size of
 % the download media divided by the piece size. However when the download media
@@ -244,6 +276,14 @@ unify_file_list_output_test() ->
     {ok, Actual_output} = unify_file_list(Input),
 
     ?assert(Actual_output =:= Expected_output).
+
+block_offsets_test(Block_size, Piece_size)
+    Expected_block_offsets = [{0, 20}, {20, 20}, {40, 20}, {60, 20}, {80, 20},
+                              {100, 1}],
+
+    {ok, Actual_block_offsets} = block_offsets(20, 101).
+
+    ?assert(Actual_block_offsets, Expected_block_offsets).
 
 create_file_mapping_single_file_test() ->
     Input_files = {files, single, "TorrentFoo", [{"/home/user/media/foo", 10000}]},

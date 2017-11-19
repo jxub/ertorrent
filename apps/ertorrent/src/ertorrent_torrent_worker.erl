@@ -16,7 +16,8 @@
          deactivate/1,
          shutdown/1,
          start_torrent/1,
-         request_peers/2
+         request_peers/2,
+         request_rx_pieces/2
         ]).
 
 -export([
@@ -33,6 +34,7 @@
 
 -include("ertorrent_log.hrl").
 
+-define(ALGO, ertorrent_algo_rarest_first).
 -define(ANNOUNCE_TIME, 120).
 -define(BENCODE, ertorrent_bencode).
 -define(BINARY, ertorrent_binary_utils).
@@ -71,15 +73,15 @@
 
 -record(state, {announce::string(),
                 announce_ref::reference(), % Timer reference for tracker announcements
-                assigned_pieces::list(), % Tuplelist with the assigned piece index and the peer's id.
                 bitfield::<<>>, % Our bitfield for bookkeeping and peer messages
-                bitfields::list(), % Current peers' bitfield e.g. [{peer's id (not peer_id), bitfield}]
+                bitfields = [], % Current peers' bitfield e.g. [{peer's id (not peer_id), bitfield}]
                 compact, % The format of the tracker announcements, 0 = non-compact, 1 = compact
+                distributed_rx_pieces::list(), % Bookkeeping of distributed pieces and number of times it is currently distributed, e.g. [{Piece_index, Distribute_counter}]
                 downloaded::integer(), % Tracker information about how much has been downloaded
                 event::event_type(),
                 files::tuple(), % Files tuple e.g. {files, multiple, Name, Files_list}
                 file_paths::list(),
-                file_worker::integer(), % The ID for file workers are unique integers
+                file_worker::reference(), % The ID for file workers are unique integers
                 info_hash_str::string(),
                 info_hash_bin::binary(),
                 left::integer(), % Tracker information about how much is left to download
@@ -91,8 +93,8 @@
                 peer_listen_port::integer(),
                 peers_max::integer(), % The maximum amount of peers this torrent is allowed to have
                 peers_cur::integer(), % Current number of active peers
-                pieces::list(), % Piece hashes from the metainfo
-                pieces_distributed::list(), % Bookkeeping of distributed pieces and number of times it is currently distributed, e.g. [{Piece_index, Distribute_counter}]
+                pieces::list(), % A list of piece index
+                remaining_pieces::list(), % Prioritized list of the remaining pieces
                 state:: initializing | active | inactive,
                 start_when_ready::boolean(), % TODO use this, if the torrent should start regardless of user input. Should also be used if you want to activate the torrent whenever the torrent is shifting state from initializing to inactive.
                 stats_leechers::integer(), % Stats from the tracker that might be of interest
@@ -116,8 +118,15 @@ activate(Torrent_w_id) ->
 deactivate(Torrent_w_id) ->
     gen_server:cast(Torrent_w_id, {deactivate}).
 
-request_peers(Torrent_w_id, Amount_of_peers) ->
-    gen_server:cast(Torrent_w_id, {torrent_w_request_peers, Amount_of_peers}).
+% @doc Used by the peer server to request a new set of potential peers.
+% @end
+request_peers(Torrent_w_id, Peer_number) ->
+    gen_server:cast(Torrent_w_id, {torrent_w_request_peers, Peer_number}).
+
+% @doc Used by peer workers when their rx queue is close to being empty.
+% @end
+request_rx_pieces(Torrent_w_id, Piece_number) ->
+    gen_server:cast(Torrent_w_id, {torrent_w_request_rx_pieces, self(), Piece_number}).
 
 % Starting server
 start_link(ID, Args) ->
@@ -279,6 +288,7 @@ init([Metainfo, Start_when_ready]) ->
     ?HASH_SRV:hash_files(Piece_layout),
 
     State = #state{announce = Announce_address,
+                   distributed_rx_pieces = [],
                    downloaded = 0,
                    event = stopped,
                    files = Resolved_files,
@@ -293,7 +303,6 @@ init([Metainfo, Start_when_ready]) ->
                    peers_cur = 0,
                    peers_max = 10,
                    pieces = Pieces,
-                   pieces_distributed = [],
                    start_when_ready = Start_when_ready,
                    uploaded = 0},
 
@@ -316,7 +325,8 @@ handle_cast({torrent_w_request_peers, Peer_amount}, State) ->
     lager:debug("~p: ~p: torrent_w_request_peers, amount '~p'",
                 [?MODULE, ?FUNCTION_NAME, Peer_amount]),
 
-    lager:debug("LENGTH PEERS '~p'", [length(State#state.peers)]),
+    lager:debug("~p: ~p: number of peers '~p'", [?MODULE, ?FUNCTION_NAME,
+                                                 length(State#state.peers)]),
 
     % Check if the current list of potential peers is sufficient otherwise make
     % a new announcement to request more peers.
@@ -344,6 +354,22 @@ handle_cast({torrent_w_request_peers, Peer_amount}, State) ->
             New_state = State#state{announce_ref = Ref,
                                     peers_cur = Current_peers}
     end,
+
+    {noreply, New_state, hibernate};
+% @doc Request from a peer worker to fill up its queue for pieces to request
+% from a peer.
+% @end
+handle_cast({torrent_w_request_rx_pieces, From, Peer_bitfield, Piece_number}, State) ->
+    % TODO The distribution limit should not be controlled within this function
+    {ok, Pieces, New_distrib_pieces} = ?ALGO:create_piece_queue(Peer_bitfield,
+                                                                State#state.remaining_pieces,
+                                                                State#state.distributed_rx_pieces,
+                                                                1,
+                                                                Piece_number),
+
+    From ! {torrent_w_rx_pieces, Pieces},
+
+    New_state = State#state{distributed_rx_pieces = New_distrib_pieces},
 
     {noreply, New_state, hibernate};
 %% User input that should change the torrent state from inactive to active
@@ -436,7 +462,7 @@ handle_info({tracker_announce, Response}, State) ->
             % Create a list, equal to the amount of missing peers, to activate
             {Peers_activate, Peers_rest} = lists:split(Missing_nbr_peers, Peer_list),
 
-            lager:debug("peers: ~p", [Peer_list]),
+            lager:debug("~p: ~p: peers: '~p'", [?MODULE, ?FUNCTION_NAME, Peer_list]),
 
             % Tell the peer_s to start the peers
             ?PEER_SRV:add_rx_peers(State#state.info_hash_bin, Peers_activate);
@@ -473,15 +499,20 @@ handle_info({peer_s_rx_peers, Peers}, State) ->
 % one-way communication.
 % @end
 handle_info({peer_w_rx_bitfield, ID, Bitfield}, State) ->
+    {ok, Bitfield_list} = ?BINARY:bitfield_to_list(State#state.bitfield),
+
     New_bitfields = [{ID, Bitfield}| State#state.bitfields],
 
-    New_state = State#state{bitfields = New_bitfields},
-    % TODO
-    % - update the algorithm module
+    {ok, Remaining_pieces} = ?ALGO:order_rx_pieces(New_bitfields,
+                                                   Bitfield_list),
+
+    New_state = State#state{bitfields = New_bitfields,
+                            remaining_pieces = Remaining_pieces},
 
     {noreply, New_state};
 
-% @doc A peer worker need to serve the current bitfield to a connecting peer.
+% @doc A peer worker need to serve the torrent current bitfield to a connecting
+% peer.
 % @end
 handle_info({peer_w_tx_bitfield_req, ID}, State) ->
     ID ! {torrent_w_tx_bitfield_res, State#state.bitfield},
@@ -530,13 +561,16 @@ handle_info({file_w_write_offset_res, _From, {_Info_hash, _Piece_idx}}, State) -
 handle_info({peer_w_terminate, ID, _Current_piece_index}, State) ->
     lager:debug("~p: ~p: peer_w_terminate", [?MODULE, ?FUNCTION_NAME]),
 
-    case State#state.bitfields /= undefined of
-        true ->
-            % Remove the peer_w's bitfield
-            New_bitfields = lists:keytake(ID, 1, State#state.bitfields),
-            New_state = State#state{bitfields = New_bitfields};
+    % Remove the peer_w's bitfield
+    case lists:keytake(ID, 1, State#state.bitfields) of
+        {value, {ID, _Bitfield}, New_bitfields} ->
+            {ok, Bitfield_list} = ?BINARY:bitfield_to_list(State#state.bitfield),
+            Remaining_pieces = ?ALGO:order_rx_pieces(State#state.bitfields, Bitfield_list),
+            New_bitfields;
+        % Whenever a peer_w terminate before receiving a bitfield
         false ->
-            New_state = State
+            New_bitfields = State#state.bitfields,
+            Remaining_pieces = State#state.remaining_pieces
     end,
 
     % TODO
@@ -546,6 +580,9 @@ handle_info({peer_w_terminate, ID, _Current_piece_index}, State) ->
 
     % Fire up a new peer_w
     ok = request_peers(self(), 1),
+
+    New_state = State#state{bitfields = New_bitfields,
+                            remaining_pieces = Remaining_pieces},
 
     {noreply, New_state, hibernate};
 
@@ -588,7 +625,7 @@ handle_info({hash_s_hash_files_res, {_Job_ID, Hashes}}, State) ->
     % TODO calculate new #state.left amount of 1s in the bitfield times piece_length
 
     % Convert list to bitfield
-    Bitfield = ?BINARY:list_to_bitfield(Bitfield_list_ordered),
+    {ok, Bitfield} = ?BINARY:list_to_bitfield(Bitfield_list_ordered),
 
     case State#state.start_when_ready of
         true ->

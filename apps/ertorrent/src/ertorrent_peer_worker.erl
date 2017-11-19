@@ -18,7 +18,7 @@
         ]).
 
 -export([
-         start_link/5,
+         start_link/6,
          stop/1
         ]).
 
@@ -37,7 +37,7 @@
 
 -record(state, {
                 address,
-                request_buffer::list(),
+                block_length,
                 dht_port,
                 id, % peer_worker_id
                 incoming_piece::binary(),
@@ -53,6 +53,7 @@
                 keep_alive_rx_ref,
                 % Timer reference for when keep alive message should be sent
                 keep_alive_tx_ref,
+                mode:: rx | tx, % mode will dictate if the peer worker will request pieces from the peer.
                 % Piece queue is a list containing tuples with information for each piece
                 % {index, hash, data}
                 % outgoing_piece_queue will hold all the requested pieces until
@@ -63,8 +64,11 @@
                 peer_srv_pid,
                 peer_choked,
                 peer_interested,
+                piece_length,
                 port::integer(),
                 received_handshake::boolean(),
+                request_buffer::list(),
+                rx_queue::list(),
                 socket,
                 self_choked,
                 self_interested,
@@ -74,7 +78,8 @@
                 torrent_info_hash,
                 torrent_info_hash_bin,
                 torrent_peer_id,
-                torrent_pid
+                torrent_pid,
+                tx_queue
                }).
 
 % 16KB seems to be an inofficial standard among most torrent client
@@ -88,9 +93,11 @@
 % should be fine.
 -define(KEEP_ALIVE_TX_TIMER, 100000).
 
--define(PEER_SRV, ertorrent_peer_srv).
 -define(BINARY, ertorrent_binary_utils).
+-define(PEER_SRV, ertorrent_peer_srv).
 -define(PEER_PROTOCOL, ertorrent_peer_tcp_protocol).
+-define(TORRENT_W, ertorrent_torrent_worker).
+-define(UTILS, ertorrent_utils).
 
 %%% Extended client API
 
@@ -99,9 +106,9 @@ connect(ID) ->
     gen_server:cast(ID, peer_w_connect).
 
 %%% Standard client API
-start_link(ID, Info_hash, Peer_id, Socket, Torrent_pid) ->
+start_link(ID, Mode, Info_hash, Peer_id, Socket, Torrent_pid) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
-    gen_server:start_link(?MODULE, [ID, Info_hash, Peer_id, Socket, Torrent_pid], [{hibernate_after, 2000}]).
+    gen_server:start_link(?MODULE, [ID, Mode, Info_hash, Peer_id, Socket, Torrent_pid], [{hibernate_after, 2000}]).
 
 stop(ID) ->
     io:format("stopping~n"),
@@ -173,16 +180,16 @@ handle_bitfield(Bitfield, State) ->
     lager:info("~p: ~p: peer '~p' received bitfield: '~p', list: '~p'",
                [?MODULE, ?FUNCTION_NAME, State#state.id, Bitfield, Bf_list]),
 
-    State#state.torrent_pid ! {peer_w_bitfield, State#state.id, Bitfield},
+    State#state.torrent_pid ! {peer_w_rx_bitfield, State#state.id, Bitfield},
 
     {ok, State}.
 
 handle_have(Piece_idx, State) ->
-    lager:debug("~p: HAVE, piece index: '~p'", [?FUNCTION_NAME, Piece_idx]),
+    lager:debug("~p: ~p: HAVE, piece index: '~p'", [?MODULE, ?FUNCTION_NAME, Piece_idx]),
 
     New_bitfield = ?BINARY:set_bit(Piece_idx, 1, State#state.peer_bitfield),
 
-    State#state.peer_srv_pid ! {peer_w_bitfield_update, New_bitfield},
+    State#state.peer_srv_pid ! {peer_w_rx_bitfield_update, New_bitfield},
     % TODO if we're sending a piece that is announced in a HAVE message, should
     % we cancel the tranmission or ignore it and wait for a CANCEL message?
 
@@ -257,9 +264,9 @@ handle_piece(Index, Begin, Data, State) ->
 % "If a peer chokes a remote peer, it MUST also discard any unanswered
 % requests for blocks previously received from the remote peer."
 handle_choke(State) ->
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
     % Inform the other subsystems that this peer is choked
     % TODO I am adding this for the future if we want to display this in any way
-    State#state.peer_srv_pid ! {peer_w_choke, State#state.id},
 
     % Updating the peer state and clearing the request buffer
     New_state = State#state{peer_choked = true,
@@ -267,14 +274,14 @@ handle_choke(State) ->
 
     {ok, New_state}.
 handle_unchoke(State) ->
-    State#state.peer_srv_pid ! {peer_w_unchoke, State#state.id},
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 
     % Updating the peer state
     New_state = State#state{peer_choked = false},
 
     {ok, New_state}.
 handle_interested(State) ->
-    State#state.peer_srv_pid ! {peer_w_interested, State#state.id},
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 
     % Updating the peer state
     New_state = State#state{peer_interested = true},
@@ -282,13 +289,14 @@ handle_interested(State) ->
     {ok, New_state}.
 % TODO figure out how to handle not interested
 handle_not_interested(State) ->
-    State#state.peer_srv_pid ! {peer_w_not_interested, State#state.id},
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 
     % Updating the peer state
     New_state = State#state{peer_interested = false},
 
     {ok, New_state}.
 handle_cancel(Index, Begin, Length, State) ->
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
     % Remove the buffered request and possible duplicates
     New_buffered_requests = lists:filter(
                                 fun(X) ->
@@ -314,23 +322,70 @@ handle_cancel(Index, Begin, Length, State) ->
 
     {ok, New_state}.
 handle_port(Port, State) ->
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
     New_state = State#state{dht_port = Port},
     {ok, New_state}.
 
 parse_peer_flags(Flags_bin) ->
-    lager:debug("~p: ~p: parse_peer_flags", [?MODULE, ?FUNCTION_NAME]),
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 
     Fast_extension = 16#4 band Flags_bin == 16#04,
 
     Flags = [{fast_extension, Fast_extension}],
     {ok, Flags}.
 
+send_message(Socket, Message, State) ->
+    case State#state.self_choked == true of
+        false -> Choked = false;
+        true ->
+            {ok, Unchoke_msg} = ?PEER_PROTOCOL:msg_unchoke(),
+            case gen_tcp:send(Socket, Unchoke_msg) of
+                ok ->
+                    Choked = false;
+                {error, Unchoke_reason} ->
+                    Choked = true,
+                    lager:debug("~p: ~p: unchoke reason '~p'", [?MODULE,
+                                                                ?FUNCTION_NAME,
+                                                                Unchoke_reason])
+            end
+    end,
+    case State#state.self_interested == true of
+        true -> Interested = true;
+        false ->
+            {ok, Interested_msg} = ?PEER_PROTOCOL:msg_interested(),
+            case gen_tcp:send(Socket, Interested_msg) of
+                ok ->
+                    Interested = true;
+                {error, Interested_reason} ->
+                    Interested = false,
+                    lager:debug("~p: ~p: interested reason '~p'", [?MODULE,
+                                                                ?FUNCTION_NAME,
+                                                                Interested_reason])
+            end
+    end,
+    case gen_tcp:send(Socket, Message) of
+        ok -> ok;
+        {error, Reason} ->
+            lager:debug("~p: ~p: reason '~p'", [?MODULE, ?FUNCTION_NAME, Reason])
+    end,
+
+    State#state{self_choked = Choked,
+                self_interested = Interested}.
+
+
+peer_request(Socket, {Piece_index, Begin, Length}, State) ->
+    {ok, Message} = ?PEER_PROTOCOL:msg_request(Piece_index, Begin, Length),
+
+    send_message(Socket, Message, State).
+
 %%% Callback module
-init([ID, Info_hash, Peer_id, {Address, Port}, Torrent_pid]) when is_integer(ID)
-                                                             andalso is_binary(Info_hash) ->
+init([ID, Mode, Info_hash, Peer_id, {Address, Port}, Torrent_pid])
+      when is_integer(ID)
+      andalso is_binary(Info_hash) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
     {ok, #state{id=ID,
                 address=Address,
+                mode=Mode,
                 peer_id=Peer_id, % TODO Should this be retreived from settings_srv?
                 peer_choked = true,
                 peer_interested = true,
@@ -497,6 +552,25 @@ handle_info({peer_srv_tx_piece, Index, Hash, Data}, State) ->
 
     {noreply, New_state, hibernate};
 
+handle_info({torrent_w_rx_pieces, Pieces}, State) ->
+    Block_offsets = ?UTILS:block_offsets(State#state.block_length,
+                                        State#state.piece_length),
+
+    Add_rx_queue = [{Piece_index, Block_offset, Block_length} ||
+                    {Block_offset, Block_length} <- Block_offsets,
+                    Piece_index <- Pieces],
+
+    Requests = lists:sublist(Add_rx_queue, 5),
+
+    Foreach = fun(Request) ->
+                  peer_request(State#state.socket, Request, State)
+              end,
+    lists:foreach(Foreach, Requests),
+
+    New_state = State#state{rx_queue = State#state.rx_queue ++ Add_rx_queue},
+
+    {noreply, New_state, hibernate};
+
 %% Messages from gen_tcp
 % TODO:
 % - Implement the missing fast extension
@@ -542,7 +616,7 @@ handle_info({tcp, _S, <<Length:32/big-integer,
             lager:debug("~p: ~p: message choke", [?MODULE, ?FUNCTION_NAME]),
             {ok, New_state} = handle_choke(State);
         ?UNCHOKE ->
-            lager:debug("~p: ~p: message uncoke", [?MODULE, ?FUNCTION_NAME]),
+            lager:debug("~p: ~p: message unchoke", [?MODULE, ?FUNCTION_NAME]),
             {ok, New_state} = handle_unchoke(State);
         ?INTERESTED ->
             lager:debug("~p: ~p: message interested", [?MODULE, ?FUNCTION_NAME]),
@@ -598,9 +672,14 @@ handle_info({tcp, _S, <<19/integer,
     {ok, Flags} = parse_peer_flags(Flags_bin),
     lager:debug("~p: ~p: peer flags '~p'", [?MODULE, ?FUNCTION_NAME, Flags]),
 
-    % TODO add validation of Peer_id
     case State#state.torrent_info_hash_bin == Info_hash of
         true when State#state.received_handshake =:= false ->
+            case State#state.mode of
+                % TODO the size of the rx piece queue should be control from somewhere else
+                rx -> ?TORRENT_W:request_rx_pieces(State#state.torrent_pid, 3);
+                tx -> ok
+            end,
+
             New_state = State#state{received_handshake=true},
             {noreply, New_state, hibernate};
         true when State#state.received_handshake =:= true ->
@@ -614,7 +693,7 @@ handle_info({tcp, _S, <<19/integer,
     end;
 
 handle_info({tcp_closed, _S}, State) ->
-    lager:debug("~p: ~p: peer closed the conncetion", [?MODULE, ?FUNCTION_NAME]),
+    lager:debug("~p: ~p: peer closed the connection", [?MODULE, ?FUNCTION_NAME]),
     {stop, normal, State};
 handle_info({tcp, _S, Message}, State) ->
     lager:warning("~p: ~p: peer '~p' received an unhandled tcp message: '~p'",
