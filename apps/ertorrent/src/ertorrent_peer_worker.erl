@@ -35,6 +35,12 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
+-record(retry, {
+                attempts::integer(),
+                max_attempts::integer(),
+                queue::list()
+               }).
+
 -record(state, {
                 address,
                 block_length,
@@ -60,26 +66,28 @@
                 % they're completely transfered
                 outgoing_piece_queue::list(),
                 peer_bitfield,
-                peer_id,
-                peer_srv_pid,
-                peer_choked,
-                peer_interested,
-                piece_length,
+                peer_id::string(),
+                peer_srv_pid::pid(),
+                peer_choked::boolean(),
+                peer_interested::boolean(),
+                piece_length::integer(),
                 port::integer(),
                 received_handshake::boolean(),
+                retry::record(),
+                retry_ref,
                 request_buffer::list(),
                 rx_queue::list(),
                 socket,
-                self_choked,
-                self_interested,
+                self_choked::boolean(),
+                self_interested::boolean(),
                 state_incoming,
                 state_outgoing,
                 torrent_bitfield,
                 torrent_info_hash,
                 torrent_info_hash_bin,
                 torrent_peer_id,
-                torrent_pid,
-                tx_queue
+                torrent_pid::pid(),
+                tx_queue::list()
                }).
 
 % 16KB seems to be an inofficial standard among most torrent client
@@ -92,6 +100,7 @@
 % Should send keep-alive within two minutes. A little less than two minutes
 % should be fine.
 -define(KEEP_ALIVE_TX_TIMER, 100000).
+-define(RETRY_TIMER, 500),
 
 -define(BINARY, ertorrent_binary_utils).
 -define(PEER_SRV, ertorrent_peer_srv).
@@ -124,6 +133,11 @@ reset_tx_keep_alive(Keep_alive_tx_ref) ->
     erlang:cancel(Keep_alive_tx_ref),
 
     erlang:send_after(?KEEP_ALIVE_TX_TIMER, self(), {keep_alive_tx_timeout}).
+
+retry_loop(Old_timer_ref) ->
+    erlang:cancel(Old_timer_ref),
+
+    erlang:send_after(?RETRY_TIMER, self(), {retry_loop}),
 
 send_keep_alive(Socket) ->
     TimerRef = erlang:send_after(?KEEP_ALIVE_TX_TIMER, self(), {keep_alive_internal_timeout}),
@@ -335,45 +349,49 @@ parse_peer_flags(Flags_bin) ->
     {ok, Flags}.
 
 send_message(Socket, Message, State) ->
-    case State#state.self_choked == true of
-        false -> Choked = false;
+    case State#state.peer_choked and
+         State#state.peer_interested and
+         State#state.self_choked and
+         State#state.self_interested of
         true ->
-            {ok, Unchoke_msg} = ?PEER_PROTOCOL:msg_unchoke(),
-            case gen_tcp:send(Socket, Unchoke_msg) of
+            case gen_tcp:send(Socket, Message) of
                 ok ->
-                    Choked = false;
-                {error, Unchoke_reason} ->
-                    Choked = true,
-                    lager:debug("~p: ~p: unchoke reason '~p'", [?MODULE,
-                                                                ?FUNCTION_NAME,
-                                                                Unchoke_reason])
-            end
-    end,
-    case State#state.self_interested == true of
-        true -> Interested = true;
+                    ok;
+                {error, Reason} ->
+                    lager:debug("~p: ~p: reason '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
+                    error
+            end;
         false ->
-            {ok, Interested_msg} = ?PEER_PROTOCOL:msg_interested(),
-            case gen_tcp:send(Socket, Interested_msg) of
-                ok ->
-                    Interested = true;
-                {error, Interested_reason} ->
-                    Interested = false,
-                    lager:debug("~p: ~p: interested reason '~p'", [?MODULE,
-                                                                ?FUNCTION_NAME,
-                                                                Interested_reason])
-            end
+            lager:debug("~p: ~p: invalid states for sending", [?MODULE, ?FUNCTION_NAME]),
+            not_ready
     end,
-    case gen_tcp:send(Socket, Message) of
-        ok -> ok;
+
+
+send_interested(Socket) ->
+    {ok, Interested_msg} = ?PEER_PROTOCOL:msg_interested(),
+
+    case gen_tcp:send(Socket, Interested_msg) of
+        ok ->
+            lager:debug("~p: ~p: sent interested", [?MODULE, ?FUNCTION_NAME]),
+            ok;
         {error, Reason} ->
-            lager:debug("~p: ~p: reason '~p'", [?MODULE, ?FUNCTION_NAME, Reason])
-    end,
+            lager:warning("~p: ~p: failed to send interested", [?MODULE, ?FUNCTION_NAME]),
+            error
+    end.
 
-    State#state{self_choked = Choked,
-                self_interested = Interested}.
+send_unchoke(Socket) ->
+    {ok, Unchoked_msg} = ?PEER_PROTOCOL:msg_unchoked(),
 
+    case gen_tcp:send(Socket, Unchoked_msg) of
+        ok ->
+            lager:debug("~p: ~p: sent unchoked", [?MODULE, ?FUNCTION_NAME]),
+            ok;
+        {error, Reason} ->
+            lager:warning("~p: ~p: failed to send unchoked", [?MODULE, ?FUNCTION_NAME]),
+            error
+    end.
 
-peer_request(Socket, {Piece_index, Begin, Length}, State) ->
+send_request(Socket, {Piece_index, Begin, Length}, State) ->
     {ok, Message} = ?PEER_PROTOCOL:msg_request(Piece_index, Begin, Length),
 
     send_message(Socket, Message, State).
@@ -383,16 +401,20 @@ init([ID, Mode, Info_hash, Peer_id, {Address, Port}, Torrent_pid])
       when is_integer(ID)
       andalso is_binary(Info_hash) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
-    {ok, #state{id=ID,
-                address=Address,
-                mode=Mode,
-                peer_id=Peer_id, % TODO Should this be retreived from settings_srv?
-                peer_choked = true,
-                peer_interested = true,
-                port=Port,
-                received_handshake = false,
-                torrent_info_hash_bin=Info_hash,
-                torrent_pid=Torrent_pid}, hibernate}.
+    {ok, #state{
+                 id=ID,
+                 address=Address,
+                 mode=Mode,
+                 peer_id=Peer_id, % TODO Should this be retreived from settings_srv?
+                 peer_choked = true,
+                 peer_interested = false,
+                 port=Port,
+                 received_handshake = false,
+                 self_choked = true,
+                 self_interested = false,
+                 torrent_info_hash_bin=Info_hash,
+                 torrent_pid=Torrent_pid}, hibernate
+                }.
 
 terminate(Reason, State) ->
     lager:debug("~p: ~p: terminating, reason: '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
@@ -497,6 +519,9 @@ handle_info({keep_alive_tx_timeout}, State) ->
             {stop, Reason, State}
     end;
 
+handle_info({retry_loop}, State) ->
+    Old_retry = State#state.retry,
+
 %% Async. response when requested a new piece to transmit. Answer the cached
 %% request that triggered a piece to be retrieved from disk.
 handle_info({peer_srv_tx_piece, Index, Hash, Data}, State) ->
@@ -553,23 +578,71 @@ handle_info({peer_srv_tx_piece, Index, Hash, Data}, State) ->
     {noreply, New_state, hibernate};
 
 handle_info({torrent_w_rx_pieces, Pieces}, State) ->
-    Block_offsets = ?UTILS:block_offsets(State#state.block_length,
-                                        State#state.piece_length),
+    Self_interested_req = send_interested(State#state.socket),
 
-    Add_rx_queue = [{Piece_index, Block_offset, Block_length} ||
-                    {Block_offset, Block_length} <- Block_offsets,
-                    Piece_index <- Pieces],
+    Self_choked_req = send_unchoke(State#state.socket),
 
-    Requests = lists:sublist(Add_rx_queue, 5),
+    case Self_interested_req == ok andalso Self_choked_req == ok of
+        true ->
+            % Generate a tuple list with the block offsets and the length per block
+            Block_offsets = ?UTILS:block_offsets(State#state.block_length,
+                                                 State#state.piece_length),
 
-    Foreach = fun(Request) ->
-                  peer_request(State#state.socket, Request, State)
-              end,
-    lists:foreach(Foreach, Requests),
+            % The block offsets is the same for each piece so lets put them together in
+            % a tuplelist.
+            Add_rx_queue = [{Piece_index, Block_offset, Block_length} ||
+                            {Block_offset, Block_length} <- Block_offsets,
+                            Piece_index <- Pieces],
 
-    New_state = State#state{rx_queue = State#state.rx_queue ++ Add_rx_queue},
 
-    {noreply, New_state, hibernate};
+            % Ask for a subset of the blocks
+            % TODO add setting to control the amount of requests in the pipeline
+            Requests = lists:sublist(Add_rx_queue, 5),
+
+            % Request = {Piece_index, Block_offset, Block_length}
+            Map = fun(Request) ->
+                        send_request(State#state.socket, Request, State)
+                  end,
+            Responses = lists:map(Map, Requests),
+
+            Old_retry = State#state.retry,
+
+            case lists:member(error, Responses) of
+                true ->
+                    Reply = {stop, normal, State};
+                false ->
+                    ok
+            end,
+
+            % Check if the requests failed because of incorrect states
+            case lists:member(not_ready, Responses) of
+                true ->
+                    % Retry 5 times over 2,5 s
+                    Retry = #retry{attempts = 0,
+                                   max_attempts = 5,
+                                   queue = Requests},
+
+                    Retry_ref = erlang:send_after(?RETRY_TIMER, self(), {retry_loop});
+
+                    New_state = State#state{retry = Retry,
+                                            retry_ref = Retry_ref,
+                                            rx_queue = State#state.rx_queue ++ Add_rx_queue,
+                                            self_choked = false,
+                                            self_interested = true},
+
+                    Reply = {noreply, New_state, hibernate};
+                false ->
+                    New_state = State#state{rx_queue = State#state.rx_queue ++ Add_rx_queue,
+                                            self_choked = false,
+                                            self_interested = true},
+
+                    Reply = {noreply, New_state, hibernate}
+            end,
+
+            Reply;
+        false ->
+            {stop, normal, State}
+    end;
 
 %% Messages from gen_tcp
 % TODO:
