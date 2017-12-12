@@ -36,9 +36,9 @@
 -endif.
 
 -record(retry, {
-                attempts::integer(),
                 max_attempts::integer(),
-                queue::list()
+                queue::list(),
+                timer::integer()
                }).
 
 -record(state, {
@@ -73,7 +73,7 @@
                 piece_length::integer(),
                 port::integer(),
                 received_handshake::boolean(),
-                retry::record(),
+                retry::#retry{},
                 retry_ref,
                 request_buffer::list(),
                 rx_queue::list(),
@@ -100,7 +100,7 @@
 % Should send keep-alive within two minutes. A little less than two minutes
 % should be fine.
 -define(KEEP_ALIVE_TX_TIMER, 100000).
--define(RETRY_TIMER, 500),
+-define(RETRY_TIMER, 1000).
 
 -define(BINARY, ertorrent_binary_utils).
 -define(PEER_SRV, ertorrent_peer_srv).
@@ -133,11 +133,6 @@ reset_tx_keep_alive(Keep_alive_tx_ref) ->
     erlang:cancel(Keep_alive_tx_ref),
 
     erlang:send_after(?KEEP_ALIVE_TX_TIMER, self(), {keep_alive_tx_timeout}).
-
-retry_loop(Old_timer_ref) ->
-    erlang:cancel(Old_timer_ref),
-
-    erlang:send_after(?RETRY_TIMER, self(), {retry_loop}),
 
 send_keep_alive(Socket) ->
     TimerRef = erlang:send_after(?KEEP_ALIVE_TX_TIMER, self(), {keep_alive_internal_timeout}),
@@ -348,6 +343,20 @@ parse_peer_flags(Flags_bin) ->
     Flags = [{fast_extension, Fast_extension}],
     {ok, Flags}.
 
+prepare_request_selection(Rx_queue, Selection_size) ->
+    % Ask for a subset of the blocks
+    % TODO add setting to control the amount of requests in the pipeline
+    Requests = lists:sublist(Rx_queue, Selection_size),
+
+    Fun = fun(Socket, Request, State) ->
+              send_request(Socket, Request, State)
+          end,
+
+    % Requests = [{Piece_index, Block_offset, Block_length}, ...]
+    Selection = [{X,Y,Z} || X <- [Fun], Y <- Requests, Z <- [0]],
+
+    {ok, Selection}.
+
 send_message(Socket, Message, State) ->
     case State#state.peer_choked and
          State#state.peer_interested and
@@ -364,8 +373,7 @@ send_message(Socket, Message, State) ->
         false ->
             lager:debug("~p: ~p: invalid states for sending", [?MODULE, ?FUNCTION_NAME]),
             not_ready
-    end,
-
+    end.
 
 send_interested(Socket) ->
     {ok, Interested_msg} = ?PEER_PROTOCOL:msg_interested(),
@@ -375,7 +383,8 @@ send_interested(Socket) ->
             lager:debug("~p: ~p: sent interested", [?MODULE, ?FUNCTION_NAME]),
             ok;
         {error, Reason} ->
-            lager:warning("~p: ~p: failed to send interested", [?MODULE, ?FUNCTION_NAME]),
+            lager:warning("~p: ~p: failed to send interested, reason: '~p'",
+                          [?MODULE, ?FUNCTION_NAME, Reason]),
             error
     end.
 
@@ -387,7 +396,8 @@ send_unchoke(Socket) ->
             lager:debug("~p: ~p: sent unchoked", [?MODULE, ?FUNCTION_NAME]),
             ok;
         {error, Reason} ->
-            lager:warning("~p: ~p: failed to send unchoked", [?MODULE, ?FUNCTION_NAME]),
+            lager:warning("~p: ~p: failed to send unchoked, reason: '~p'",
+                          [?MODULE, ?FUNCTION_NAME, Reason]),
             error
     end.
 
@@ -519,8 +529,58 @@ handle_info({keep_alive_tx_timeout}, State) ->
             {stop, Reason, State}
     end;
 
+% TODO when this is used make sure to cancel the retry reference
 handle_info({retry_loop}, State) ->
     Old_retry = State#state.retry,
+
+    Max_attempts = Old_retry#retry.max_attempts,
+
+    Foldl = fun({Fun, Message, Attempts}, {Socket, Retry_list}) ->
+        case Fun(Socket, Message) of
+            % Successfully sent the piece request
+            ok ->
+                New_retry_list = Retry_list;
+            % Keep on retrying
+            not_ready when Attempts =< Max_attempts ->
+                New_retry_list = [{Fun, Message, Attempts + 1}| Retry_list];
+            % Exceeded the maximum amount of attempts for the request propagate
+            % error.
+            not_ready when Attempts > Max_attempts ->
+                lager:debug("~p: ~p: reached maximum amount of retries for message '~p', terminating peer",
+                            [?MODULE, ?FUNCTION_NAME, Message]),
+                New_retry_list = [error| Retry_list];
+            % Failed to transmit, propagate error
+            error ->
+                lager:debug("~p: ~p: failed to send message to peer, terminating peer",
+                            [?MODULE, ?FUNCTION_NAME]),
+                New_retry_list = [error| Retry_list]
+        end,
+
+        {Socket, New_retry_list}
+    end,
+    {_Socket, New_retries} = lists:foldl(Foldl, {State#state.socket, []}, Old_retry#retry.queue),
+
+    New_retry = Old_retry#retry{queue = New_retries},
+
+    % If _any_ of the retries result in an error, terminate the peer
+    case lists:member(error, 1, New_retries) of
+        false ->
+            % Check if theres any queued requests left, otherwise don't refresh the
+            % timer.
+            case length(New_retries) == 0 of
+                true ->
+                    New_state = State#state{retry = New_retry,
+                                            retry_ref = undefined};
+                false ->
+                    Ref = erlang:send_after(?RETRY_TIMER, self(), {retry_loop}),
+                    New_state = State#state{retry = New_retry,
+                                            retry_ref = Ref}
+            end,
+
+            {noreply, New_state, hibernate};
+        true ->
+            {stop, normal, State}
+    end;
 
 %% Async. response when requested a new piece to transmit. Answer the cached
 %% request that triggered a piece to be retrieved from disk.
@@ -579,7 +639,6 @@ handle_info({peer_srv_tx_piece, Index, Hash, Data}, State) ->
 
 handle_info({torrent_w_rx_pieces, Pieces}, State) ->
     Self_interested_req = send_interested(State#state.socket),
-
     Self_choked_req = send_unchoke(State#state.socket),
 
     case Self_interested_req == ok andalso Self_choked_req == ok of
@@ -594,52 +653,23 @@ handle_info({torrent_w_rx_pieces, Pieces}, State) ->
                             {Block_offset, Block_length} <- Block_offsets,
                             Piece_index <- Pieces],
 
-
-            % Ask for a subset of the blocks
-            % TODO add setting to control the amount of requests in the pipeline
-            Requests = lists:sublist(Add_rx_queue, 5),
-
-            % Request = {Piece_index, Block_offset, Block_length}
-            Map = fun(Request) ->
-                        send_request(State#state.socket, Request, State)
-                  end,
-            Responses = lists:map(Map, Requests),
-
             Old_retry = State#state.retry,
 
-            case lists:member(error, Responses) of
-                true ->
-                    Reply = {stop, normal, State};
-                false ->
-                    ok
-            end,
+            {ok, Selection} = prepare_request_selection(Add_rx_queue, 5),
 
-            % Check if the requests failed because of incorrect states
-            case lists:member(not_ready, Responses) of
-                true ->
-                    % Retry 5 times over 2,5 s
-                    Retry = #retry{attempts = 0,
-                                   max_attempts = 5,
-                                   queue = Requests},
+            % Retry every second for 5 minutes
+            Retry = #retry{max_attempts = 300,
+                           queue = [Selection| Old_retry#retry.queue],
+                           timer = 100},
 
-                    Retry_ref = erlang:send_after(?RETRY_TIMER, self(), {retry_loop});
+            New_state = State#state{retry = Retry,
+                                    rx_queue = State#state.rx_queue ++ Add_rx_queue,
+                                    self_choked = false,
+                                    self_interested = true},
 
-                    New_state = State#state{retry = Retry,
-                                            retry_ref = Retry_ref,
-                                            rx_queue = State#state.rx_queue ++ Add_rx_queue,
-                                            self_choked = false,
-                                            self_interested = true},
+            self() ! {retry_loop},
 
-                    Reply = {noreply, New_state, hibernate};
-                false ->
-                    New_state = State#state{rx_queue = State#state.rx_queue ++ Add_rx_queue,
-                                            self_choked = false,
-                                            self_interested = true},
-
-                    Reply = {noreply, New_state, hibernate}
-            end,
-
-            Reply;
+            {noreply, New_state, hibernate};
         false ->
             {stop, normal, State}
     end;
