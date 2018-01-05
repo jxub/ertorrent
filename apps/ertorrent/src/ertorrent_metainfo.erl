@@ -81,7 +81,11 @@ is_magnet(Str) ->
 
 parse_file(Filename) ->
     {ok, Data} = file:read_file(Filename),
-    ?BENCODE:decode(Data).
+    try ?BENCODE:decode(Data) of
+        {ok, Decode} -> {ok, Decode}
+    catch
+        Throw -> {throw, failed_to_decode, Throw}
+    end.
 
 parse_magnet(Uri) ->
     Urn = string:substr(Uri, 9),

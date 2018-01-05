@@ -31,8 +31,10 @@ init(_Args) ->
     % Look for configuration file in /etc
     % Look for configuration file in ~/.ertorrent
 
-    Padding = string:chars($ , 12),
-    Peer_id = lists:concat(["ET-0-0-1", Padding]),
+    % Generate a unique id
+    Id_bin = crypto:strong_rand_bytes(14),
+    Id_str = binary_to_list(Id_bin),
+    Peer_id = lists:concat(["ET001-", Id_str]),
     % Replacing reserved characters
     Peer_id_encoded = http_uri:encode(Peer_id),
 

@@ -8,6 +8,9 @@
 -define(BINARY, ertorrent_binary_utils).
 -define(UTILS, ertorrent_utils).
 
+initial_rx_pieces() ->
+
+
 % Returns a sorted tuple list with the rarest piece being the head of the list.
 % E.g. [{Piece_index, Piece_occurrences}]
 order_rx_pieces(Peer_bitfields, Own_bitfield) when is_list(Peer_bitfields) andalso
@@ -60,7 +63,9 @@ create_piece_queue(Peer_bitfield,
 
     % Filter out the pieces that are already assigned to other peer workers
     WO_limited_pieces = lists:filter(fun({Piece_index, _Occurrences}) ->
-                                         not lists:member(Piece_index, Limited_pieces)
+                                         Tmp = not lists:member(Piece_index, Limited_pieces),
+                                         lager:debug("TMP: '~p'", [Tmp]),
+                                         Tmp
                                      end, Prioritized_pieces),
 
     % Find the remaining pieces which the peer possess

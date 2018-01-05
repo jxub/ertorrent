@@ -39,6 +39,8 @@ list_to_bitfield(List) when is_list(List) ->
 
     % Contructing a new binary with each of the byte values from Bin as bits
     Bitfield = << <<X:1>> || <<X>> <= Bin >>,
+    lager:debug("~p: ~p: convert list '~p',~nbitfield '~p'",
+                [?MODULE, ?FUNCTION_NAME, List, Bitfield]),
 
     {ok, Bitfield}.
 
@@ -55,7 +57,7 @@ parse_peers4(<<A, B, C, D, Port:16, Rest/binary>>, Acc) ->
 parse_peers4(Unmatched, _Acc) ->
     lager:warning("unmatched '~p'", [Unmatched]).
 
-%% Set bit at index
+%% Set bit at index from the left
 set_bit(Index, Value, Bitfield) ->
     <<Prefix:Index/bitstring, _:1, Suffix/bitstring>> = Bitfield,
     <<Prefix:Index/bitstring, Value:1/bitstring, Suffix/bitstring>>.

@@ -9,6 +9,8 @@ Questions:
 - Check out edown if it could be used for documentation?
 
 General:
+- Find out why we stopped getting handshakes and if there is any extension with
+  an alternative handshake method.
 - Read up on OS-specifics http://erlang.org/doc/man/os.html#type-0
 - Figure out start up order. settings sup.tree needs to start up first so that
   torrent_ssup can get port settings.

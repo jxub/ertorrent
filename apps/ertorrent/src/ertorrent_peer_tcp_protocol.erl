@@ -39,6 +39,7 @@
 %     end.
 
 msg_handshake(Info_hash, Peer_id) ->
+    %Flags = 16#0004000000000000,
     {ok, <<19:8/integer,
            "BitTorrent protocol"/integer,
            0:64/big,
@@ -49,33 +50,35 @@ msg_keep_alive() ->
     {ok, <<0:32>>}.
 
 msg_choke() ->
-    {ok, <<1:32, ?CHOKE>>}.
+    {ok, <<1:32, ?CHOKE:8/big-integer>>}.
 
 msg_unchoke() ->
-    {ok, <<1:32, ?UNCHOKE>>}.
+    {ok, <<1:32, ?UNCHOKE:8/big-integer>>}.
 
 msg_interested() ->
-    {ok, <<1:32, ?INTERESTED>>}.
+    {ok, <<1:32, ?INTERESTED:8/big-integer>>}.
 
 msg_not_interested() ->
-    {ok, <<1:32, ?NOT_INTERESTED>>}.
+    {ok, <<1:32, ?NOT_INTERESTED:8/big-integer>>}.
 
 msg_have(Piece_index) ->
-    {ok, <<5:32, ?HAVE, Piece_index>>}.
+    {ok, <<5:32, ?HAVE:8/big, Piece_index>>}.
 
-msg_bitfield(Bitfield_length, Bitfield) ->
+msg_bitfield(Bitfield_length, Bitfield) when is_binary(Bitfield)->
+    lager:debug("~p: ~p: length '~p', bitfield '~p'",
+                [?MODULE, ?FUNCTION_NAME, Bitfield_length, Bitfield]),
     Length = 1 + Bitfield_length,
-    {ok, <<Length:32, ?BITFIELD, Bitfield>>}.
+    {ok, <<Length:32/big-integer, ?BITFIELD:8/big-integer, Bitfield/big-binary>>}.
 
 msg_request(Index, Begin, Length) ->
-    {ok, <<13:32, ?REQUEST, Index:32, Begin:32, Length:32>>}.
+    {ok, <<13:32, ?REQUEST:8/big, Index:32, Begin:32, Length:32>>}.
 
 msg_piece(Block_size, Index, Begin, Block) ->
     Length = 9 + Block_size,
-    {ok, <<Length:32, ?PIECE, Index:32, Begin:32, Block:32>>}.
+    {ok, <<Length:32, ?PIECE:8/big-integer, Index:32, Begin:32, Block:32>>}.
 
 msg_cancel(Index, Begin, Length) ->
-    {ok, <<13:32, ?CANCEL, Index:32, Begin:32, Length:32>>}.
+    {ok, <<13:32, ?CANCEL:8/big-integer, Index:32, Begin:32, Length:32>>}.
 
 msg_port(Listen_port) ->
-    {ok, <<3:32, ?PORT, Listen_port:32>>}.
+    {ok, <<3:32, ?PORT:8/big-integer, Listen_port:32>>}.

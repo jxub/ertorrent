@@ -14,10 +14,11 @@
 -export([
          activate/1,
          deactivate/1,
+         get_bitfield/1,
          shutdown/1,
          start_torrent/1,
          request_peers/2,
-         request_rx_pieces/2
+         request_rx_pieces/3
         ]).
 
 -export([
@@ -118,6 +119,9 @@ activate(Torrent_w_id) ->
 deactivate(Torrent_w_id) ->
     gen_server:cast(Torrent_w_id, {deactivate}).
 
+get_bitfield(Torrent_w_id) ->
+    gen_server:call(Torrent_w_id, {get_bitfield}).
+
 % @doc Used by the peer server to request a new set of potential peers.
 % @end
 request_peers(Torrent_w_id, Peer_number) ->
@@ -125,8 +129,9 @@ request_peers(Torrent_w_id, Peer_number) ->
 
 % @doc Used by peer workers when their rx queue is close to being empty.
 % @end
-request_rx_pieces(Torrent_w_id, Piece_number) ->
-    gen_server:cast(Torrent_w_id, {torrent_w_request_rx_pieces, self(), Piece_number}).
+request_rx_pieces(Torrent_w_id, Peer_bitfield, Piece_number) ->
+    gen_server:cast(Torrent_w_id, {torrent_w_request_rx_pieces, self(),
+                                   Peer_bitfield, Piece_number}).
 
 % Starting server
 start_link(ID, Args) ->
@@ -315,6 +320,10 @@ terminate(Reason, _State) ->
     ok.
 
 %% Synchronous
+
+handle_call({get_bitfield}, _From, State) ->
+    {reply, State#state.bitfield, State, hibernate};
+
 handle_call({list}, _From, _State) ->
     io:format("~p list~n",[?MODULE]),
     {ok}.
@@ -360,6 +369,8 @@ handle_cast({torrent_w_request_peers, Peer_amount}, State) ->
 % from a peer.
 % @end
 handle_cast({torrent_w_request_rx_pieces, From, Peer_bitfield, Piece_number}, State) ->
+    lager:debug("~p: ~p: creating piece queue for peer '~p'",
+                [?MODULE, ?FUNCTION_NAME, From]),
     % TODO The distribution limit should not be controlled within this function
     {ok, Pieces, New_distrib_pieces} = ?ALGO:create_piece_queue(Peer_bitfield,
                                                                 State#state.remaining_pieces,

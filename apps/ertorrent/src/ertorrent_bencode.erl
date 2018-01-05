@@ -107,6 +107,8 @@ parse_int(<<Ascii_nbr/integer, Tail/binary>>, Acc) ->
         true ->
             parse_int(Tail, Acc * 10  + Integer_part);
         false ->
+            lager:error("~p: ~p: integer '~p'",
+                        [?MODULE, ?FUNCTION_NAME, Integer_part]),
             {error, "failed to parse"}
     end.
 

@@ -20,13 +20,17 @@
                                         X])).
 
 % Macro for debug prints
--ifdef(debug).
--define(DEBUG(X), io:format("[~s,~s,~s (~p)]: ~w~n",
-                            [?MODULE,
-                             ?FUNCTION_NAME,
-                             ?LINE,
-                             self(),
-                             X])).
--else.
--define(DEBUG(X), void).
--endif.
+%-ifdef(debug).
+%-define(DEBUG(X), io:format("[~s,~s,~s (~p)]: ~w~n",
+%                            [?MODULE,
+%                             ?FUNCTION_NAME,
+%                             ?LINE,
+%                             self(),
+%                             X])).
+%-else.
+%-define(DEBUG(X), void).
+%-endif.
+
+% debug(Str, Var_list) when is_list(Var_list) ->
+%     lager:debug(Str, Var_list).
+

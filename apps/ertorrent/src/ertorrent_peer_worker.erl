@@ -80,6 +80,7 @@
                 socket,
                 self_choked::boolean(),
                 self_interested::boolean(),
+                sent_handshake::boolean(),
                 state_incoming,
                 state_outgoing,
                 torrent_bitfield,
@@ -124,6 +125,13 @@ stop(ID) ->
     gen_server:cast({?MODULE, ID}, stop).
 
 %%% Internal functions
+debug(Str, Args) when is_list(Args) ->
+    Str_pre = "~p: ~p [~p]: ",
+    Str_post = lists:concat(Str_pre, Str),
+    Args_pre = [?MODULE, ?FUNCTION_NAME, self()],
+    Args_post = lists:concat([Args_pre, Args]),
+    lager:debug(Str_post, Args_post).
+
 reset_rx_keep_alive(Keep_alive_rx_ref) ->
     erlang:cancel(Keep_alive_rx_ref),
 
@@ -209,6 +217,7 @@ handle_have(Piece_idx, State) ->
                             peer_bitfield = New_bitfield},
 
     {ok, New_state}.
+
 handle_request(Index, Begin, Length, State) ->
     lager:debug("~p: REQUEST, index: '~p', begin: '~p', length: '~p'",
                 [?FUNCTION_NAME, Index, Begin, Length]),
@@ -240,7 +249,10 @@ handle_request(Index, Begin, Length, State) ->
     end,
 
     {ok, New_state}.
+
 handle_piece(Index, Begin, Data, State) ->
+    lager:debug("~p:~p", [?MODULE, ?FUNCTION_NAME]),
+
     % Check that the piece is requested
     case Index == State#state.incoming_piece_index of
         true ->
@@ -338,9 +350,15 @@ handle_port(Port, State) ->
 parse_peer_flags(Flags_bin) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 
-    Fast_extension = 16#4 band Flags_bin == 16#04,
+    Flags_list = binary_to_list(Flags_bin),
 
-    Flags = [{fast_extension, Fast_extension}],
+    % nth is index 1-based
+    Byte_seven = lists:nth(8, Flags_list),
+    Fast_extension = 16#04,
+    Got_fast_extension = Byte_seven band Fast_extension == Fast_extension,
+    lager:debug("FAST_EXTENSION: '~p'", [Got_fast_extension]),
+
+    Flags = [{fast_extension, Got_fast_extension}],
     {ok, Flags}.
 
 prepare_request_selection(Rx_queue, Selection_size) ->
@@ -356,6 +374,19 @@ prepare_request_selection(Rx_queue, Selection_size) ->
     Selection = [{X,Y,Z} || X <- [Fun], Y <- Requests, Z <- [0]],
 
     {ok, Selection}.
+
+send_bitfield(Socket, Bitfield) ->
+    Bitfield_len = bit_size(Bitfield),
+
+    {ok, Bitfield_msg} = ?PEER_PROTOCOL:msg_bitfield(Bitfield_len, Bitfield),
+
+    gen_tcp:send(Socket, Bitfield_msg).
+
+send_handshake(Socket, Peer_id_str, Torrent_info_bin) ->
+    Peer_id = list_to_binary(Peer_id_str),
+    {ok, Handshake} = ?PEER_PROTOCOL:msg_handshake(Torrent_info_bin,
+                                                   Peer_id),
+    gen_tcp:send(Socket, Handshake).
 
 send_message(Socket, Message, State) ->
     case State#state.peer_choked and
@@ -422,6 +453,7 @@ init([ID, Mode, Info_hash, Peer_id, {Address, Port}, Torrent_pid])
                  received_handshake = false,
                  self_choked = true,
                  self_interested = false,
+                 sent_handshake = false,
                  torrent_info_hash_bin=Info_hash,
                  torrent_pid=Torrent_pid}, hibernate
                 }.
@@ -465,10 +497,6 @@ handle_cast(peer_w_connect, State) ->
     lager:debug("~p: ~p: connect", [?MODULE,
                                     ?FUNCTION_NAME]),
 
-    Peer_id = list_to_binary(State#state.peer_id),
-    {ok, Handshake} = ?PEER_PROTOCOL:msg_handshake(State#state.torrent_info_hash_bin,
-                                                   Peer_id),
-
     case gen_tcp:connect(State#state.address,
                          State#state.port, [binary, {packet, 0}], 2000) of
         {ok, Socket} ->
@@ -477,8 +505,9 @@ handle_cast(peer_w_connect, State) ->
                                                               State#state.address,
                                                               State#state.port
                                                              ]),
-            case gen_tcp:send(Socket,
-                              Handshake) of
+            case send_handshake(Socket,
+                                State#state.peer_id,
+                                State#state.torrent_info_hash_bin) of
                 ok ->
                     lager:debug("~p: ~p: sent handshake", [?MODULE, ?FUNCTION_NAME]),
                     % This is automatically canceled if the process terminates
@@ -491,9 +520,10 @@ handle_cast(peer_w_connect, State) ->
                                                           {keep_alive_rx_timeout}),
 
                     {noreply,
-                     State#state{keep_alive_rx_ref=Keep_alive_rx_ref,
-                                 keep_alive_tx_ref=Keep_alive_tx_ref,
-                                 socket=Socket},
+                     State#state{keep_alive_rx_ref = Keep_alive_rx_ref,
+                                 keep_alive_tx_ref = Keep_alive_tx_ref,
+                                 sent_handshake = true,
+                                 socket = Socket},
                      hibernate};
                 {error, Reason} ->
                     lager:debug("~p: ~p: failed send handshake, reason: '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
@@ -531,6 +561,7 @@ handle_info({keep_alive_tx_timeout}, State) ->
 
 % TODO when this is used make sure to cancel the retry reference
 handle_info({retry_loop}, State) ->
+    debug("retry", []),
     Old_retry = State#state.retry,
 
     Max_attempts = Old_retry#retry.max_attempts,
@@ -638,6 +669,8 @@ handle_info({peer_srv_tx_piece, Index, Hash, Data}, State) ->
     {noreply, New_state, hibernate};
 
 handle_info({torrent_w_rx_pieces, Pieces}, State) ->
+    lager:debug("~p: ~p: torrent_w_rx_pieces: '~p'", [?MODULE, ?FUNCTION_NAME, Pieces]),
+
     Self_interested_req = send_interested(State#state.socket),
     Self_choked_req = send_unchoke(State#state.socket),
 
@@ -667,10 +700,12 @@ handle_info({torrent_w_rx_pieces, Pieces}, State) ->
                                     self_choked = false,
                                     self_interested = true},
 
+            lager:debug("INITIALIZING RETRY", []),
             self() ! {retry_loop},
 
             {noreply, New_state, hibernate};
         false ->
+            lager:debug("failed to send interest och unchoke", []),
             {stop, normal, State}
     end;
 
@@ -678,13 +713,86 @@ handle_info({torrent_w_rx_pieces, Pieces}, State) ->
 % TODO:
 % - Implement the missing fast extension
 
-%% @doc Handling incoming peer handshaked.
 handle_info({tcp, _S, <<>>}, State) ->
     New_keep_alive_rx_ref = reset_rx_keep_alive(State#state.keep_alive_rx_ref),
 
     New_state = State#state{keep_alive_rx_ref=New_keep_alive_rx_ref},
 
     {noreply, New_state, hibernate};
+handle_info({tcp, _S, <<19/integer,
+                        "BitTorrent protocol",
+                        Flags_bin:8/bytes,
+                        Info_hash:20/bytes,
+                        Peer_id/bytes>>}, % Put the rest of the message into peer id, seen cases where this is 25 bytes and should be 20 bytes
+             State)  ->
+    lager:debug("~p: ~p: received a handshake,~nflags: '~p',~ninfo hash: '~p',~npeer id: '~p'",
+                [
+                 ?MODULE,
+                 ?FUNCTION_NAME,
+                 Flags_bin,
+                 binary_to_list(Info_hash),
+                 binary_to_list(Peer_id)
+                ]),
+
+    {ok, Flags} = parse_peer_flags(Flags_bin),
+    lager:debug("~p: ~p: peer flags '~p'", [?MODULE, ?FUNCTION_NAME, Flags]),
+
+    case State#state.torrent_info_hash_bin == Info_hash of
+        true when State#state.received_handshake =:= false ->
+            Socket = State#state.socket,
+
+            lager:debug("MODE: '~p'", [State#state.mode]),
+
+            Request_rx_pieces = fun(S) ->
+                                    case S#state.mode of
+                                        % TODO the size of the rx piece queue
+                                        % should be control from somewhere else
+                                        rx -> ?TORRENT_W:request_rx_pieces(S#state.torrent_pid,
+                                                                           S#state.peer_bitfield,
+                                                                           3);
+                                        tx -> ok
+                                    end
+                                end,
+
+            case State#state.sent_handshake of
+                true ->
+                    Handshake = ok;
+                false ->
+                    Handshake = send_handshake(Socket,
+                                               State#state.peer_id,
+                                               State#state.torrent_info_hash_bin)
+            end,
+
+            % Send bitfield
+            Bitfield = ?TORRENT_W:get_bitfield(State#state.torrent_pid),
+            lager:debug("OWN BITFIELD length '~p' '~p'", [bit_size(Bitfield), Bitfield]),
+
+            case Handshake == ok andalso send_bitfield(Socket, Bitfield) of
+                ok ->
+                    lager:debug("~p: ~p: requested rx pieces", [?MODULE, ?FUNCTION_NAME]),
+                    Request_rx_pieces(State),
+                    New_state = State#state{received_handshake = true,
+                                            sent_handshake = true},
+                    {noreply, New_state, hibernate};
+                false ->
+                    {error, Reason} = Handshake,
+                    lager:debug("~p: ~p: failed to send handshake '~p'",
+                                [?MODULE, ?FUNCTION_NAME, Reason]),
+                    {stop, normal, State};
+                {error, Reason} ->
+                    lager:debug("~p: ~p: failed to send bitfield '~p'",
+                                [?MODULE, ?FUNCTION_NAME, Reason]),
+                    {stop, normal, State}
+            end;
+        true when State#state.received_handshake =:= true ->
+            lager:info("~p: ~p: received multiple handshakes for peer: '~p'",
+                       [?MODULE, ?FUNCTION_NAME, State#state.id]),
+            {noreply, State, hibernate};
+        false ->
+            lager:warning("~p: ~p: received invalid info hash in handshake for peer: '~p'",
+                          [?MODULE, ?FUNCTION_NAME, State#state.id]),
+            {stop, normal, State}
+    end;
 handle_info({tcp, _S, <<Length:32/big-integer,
                         Message_id:8/big-integer,
                         Rest/binary>>}, State) ->
@@ -728,7 +836,8 @@ handle_info({tcp, _S, <<Length:32/big-integer,
             lager:debug("~p: ~p: message not interested", [?MODULE, ?FUNCTION_NAME]),
             {ok, New_state} = handle_not_interested(State);
         ?BITFIELD ->
-            lager:debug("~p: ~p: message bitfield", [?MODULE, ?FUNCTION_NAME]),
+            lager:debug("~p: ~p: message bitfield length '~p', bitfield '~p'",
+                        [?MODULE, ?FUNCTION_NAME, bit_size(Rest), Rest]),
             <<Bitfield/binary>> = Rest,
             {ok, New_state} = handle_bitfield(Bitfield, State);
         ?PORT ->
@@ -752,48 +861,11 @@ handle_info({tcp, _S, <<Length:32/big-integer,
             lager:debug("~p: ~p: message allowed fast", [?MODULE, ?FUNCTION_NAME]),
             New_state = State;
         _ ->
-            lager:debug("~p: ~p: unhandled message id '~p'",
-                        [?MODULE, ?FUNCTION_NAME, Message_id]),
+            lager:debug("~p: ~p: unhandled message id '~p', handshake '~p', request '~p'",
+                        [?MODULE, ?FUNCTION_NAME, Message_id, State#state.received_handshake, Rest]),
             New_state = State
     end,
     {noreply, New_state, hibernate};
-handle_info({tcp, _S, <<19/integer,
-                        "BitTorrent protocol",
-                        Flags_bin:8/bytes,
-                        Info_hash:20/bytes,
-                        Peer_id/bytes>>}, % Put the rest of the message into peer id, seen cases where this is 25 bytes and should be 20 bytes
-             State)  ->
-    lager:debug("~p: ~p: received a handshake,~nflags: '~p',~ninfo hash: '~p',~npeer id: '~p'",
-                [
-                 ?MODULE,
-                 ?FUNCTION_NAME,
-                 Flags_bin,
-                 binary_to_list(Info_hash),
-                 binary_to_list(Peer_id)
-                ]),
-
-    {ok, Flags} = parse_peer_flags(Flags_bin),
-    lager:debug("~p: ~p: peer flags '~p'", [?MODULE, ?FUNCTION_NAME, Flags]),
-
-    case State#state.torrent_info_hash_bin == Info_hash of
-        true when State#state.received_handshake =:= false ->
-            case State#state.mode of
-                % TODO the size of the rx piece queue should be control from somewhere else
-                rx -> ?TORRENT_W:request_rx_pieces(State#state.torrent_pid, 3);
-                tx -> ok
-            end,
-
-            New_state = State#state{received_handshake=true},
-            {noreply, New_state, hibernate};
-        true when State#state.received_handshake =:= true ->
-            lager:info("~p: ~p: received multiple handshakes for peer: '~p'",
-                       [?MODULE, ?FUNCTION_NAME, State#state.id]),
-            {noreply, State, hibernate};
-        false ->
-            lager:warning("~p: ~p: received invalid info hash in handshake for peer: '~p'",
-                          [?MODULE, ?FUNCTION_NAME, State#state.id]),
-            {stop, "invalid handshake", State}
-    end;
 
 handle_info({tcp_closed, _S}, State) ->
     lager:debug("~p: ~p: peer closed the connection", [?MODULE, ?FUNCTION_NAME]),
