@@ -26,7 +26,7 @@ content_types_provided(Req, State) ->
      ], Req, State}.
 
 top_html(Req, State) ->
-    {ok, Metainfo} = ertorrent_metainfo:parse_file("/home/orz/downloads/debian-9.1.0-amd64-netinst.iso.torrent"),
+    {ok, Metainfo} = ertorrent_metainfo:parse_file("/home/orz/downloads/debian-9.3.0-amd64-netinst.iso.torrent"),
     {ok, Reply} = ertorrent_torrent_srv:add(Metainfo, true),
 
     Resp = list_to_binary(Reply),

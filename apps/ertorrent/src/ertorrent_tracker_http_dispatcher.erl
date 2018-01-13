@@ -43,14 +43,22 @@ announce2(Address, Info_hash, Peer_id, Port, Uploaded, Downloaded, Left, Event, 
                                            Left,
                                            Event,
                                            0),
-    lager:debug("~p: ~p: prepared request '~p'", [?MODULE, ?FUNCTION_NAME, Request]),
+    lager:debug("~p: ~p: prepared request '~s'", [?MODULE, ?FUNCTION_NAME, Request]),
 
     case hackney:request(get, list_to_binary(Request), [], <<>>, []) of
-        {ok, _StatusCode, _Headers, ClientRef} ->
+        {ok, 200, _Headers, ClientRef} ->
             {ok, Body} = hackney:body(ClientRef),
             ?BENCODE:decode(Body);
+        {ok, Status_code, _Headers, ClientRef} ->
+            {ok, Body} = hackney:body(ClientRef),
+            lager:warning("~p: ~p: bad HTTP response(~p): '~p'", [?MODULE,
+                                                                  ?FUNCTION_NAME,
+                                                                  Status_code,
+                                                                  Body]),
+            error;
         {error, Reason} ->
-            lager:warning("failed to announce: '~p'", [Reason])
+            lager:warning("failed to announce: '~p'", [Reason]),
+            error
     end.
 
 % TODO make use of compact

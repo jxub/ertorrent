@@ -38,6 +38,15 @@ General:
 - TERMS Decide on a term for torrent start_when_ready feature, state =
   "active"?
 
+http_dispatcher:
+- Investigate the issue when we sometimes receive an error related to decoding
+  the announce data because we get an HTML response with a bad request page.
+  The request from announce2 is never reaching it's destination and bounce on
+  the local network, alternatively failing to setup a socket to the tracker and
+  we receive a default response. REASON: We don't URL encode the peer id
+  properly and in some cases we get an invalid seed when generating the peer
+  id.
+
 file_srv:
 - Implement handle_info({file_w_pread_resp
 

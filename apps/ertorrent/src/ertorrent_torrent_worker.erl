@@ -15,6 +15,7 @@
          activate/1,
          deactivate/1,
          get_bitfield/1,
+         get_block_length/1,
          shutdown/1,
          start_torrent/1,
          request_peers/2,
@@ -76,6 +77,7 @@
                 announce_ref::reference(), % Timer reference for tracker announcements
                 bitfield::<<>>, % Our bitfield for bookkeeping and peer messages
                 bitfields = [], % Current peers' bitfield e.g. [{peer's id (not peer_id), bitfield}]
+                block_length::integer(), % Length of a block, this is decided by the client and is specified in settings_srv
                 compact, % The format of the tracker announcements, 0 = non-compact, 1 = compact
                 distributed_rx_pieces::list(), % Bookkeeping of distributed pieces and number of times it is currently distributed, e.g. [{Piece_index, Distribute_counter}]
                 downloaded::integer(), % Tracker information about how much has been downloaded
@@ -95,6 +97,7 @@
                 peers_max::integer(), % The maximum amount of peers this torrent is allowed to have
                 peers_cur::integer(), % Current number of active peers
                 pieces::list(), % A list of piece index
+                piece_length::integer(), % Length of a piece (in bytes). This is retreived from the metainfo.
                 remaining_pieces::list(), % Prioritized list of the remaining pieces
                 state:: initializing | active | inactive,
                 start_when_ready::boolean(), % TODO use this, if the torrent should start regardless of user input. Should also be used if you want to activate the torrent whenever the torrent is shifting state from initializing to inactive.
@@ -121,6 +124,9 @@ deactivate(Torrent_w_id) ->
 
 get_bitfield(Torrent_w_id) ->
     gen_server:call(Torrent_w_id, {get_bitfield}).
+
+get_block_length(Torrent_w_id) ->
+    gen_server:call(Torrent_w_id, {get_block_length}).
 
 % @doc Used by the peer server to request a new set of potential peers.
 % @end
@@ -164,16 +170,26 @@ tracker_announce_loop(State) ->
                         [?MODULE, ?FUNCTION_NAME])
     end,
 
+    Announce = fun() ->
+                   ?TRACKER:announce2(State#state.announce,
+                                      State#state.info_hash_str,
+                                      State#state.peer_id,
+                                      State#state.peer_listen_port,
+                                      State#state.uploaded,
+                                      State#state.downloaded,
+                                      State#state.left,
+                                      atom_to_list(State#state.event),
+                                      State#state.compact)
+               end,
+
     % TODO make this async
-    {ok, Response} = ?TRACKER:announce2(State#state.announce,
-                                        State#state.info_hash_str,
-                                        State#state.peer_id,
-                                        State#state.peer_listen_port,
-                                        State#state.uploaded,
-                                        State#state.downloaded,
-                                        State#state.left,
-                                        atom_to_list(State#state.event),
-                                        State#state.compact),
+    case Announce() of
+        {ok, Response_tmp} ->
+            Response = Response_tmp;
+        error ->
+            {ok, Response} = Announce(),
+            Response
+    end,
 
     lager:warning("~p: ref '~p'", [?FUNCTION_NAME, self()]),
 
@@ -235,7 +251,7 @@ init([Metainfo, Start_when_ready]) ->
     {ok, Info_hash_str} = ?UTILS:hash_digest_to_string(Info_encoded),
 
     {ok, Announce_address} = ?METAINFO:get_value(<<"announce">>, Metainfo),
-    {ok, Piece_max_length} = ?METAINFO:get_value(<<"piece length">>, Info),
+    {ok, Piece_length} = ?METAINFO:get_value(<<"piece length">>, Info),
     % Prepare a list of pieces since, the piece section of the metainfo
     % consists of a concatenated binary of all the pieces.
     {ok, Pieces_bin} = ?METAINFO:get_value(<<"pieces">>, Info),
@@ -244,11 +260,12 @@ init([Metainfo, Start_when_ready]) ->
 
     {ok, Piece_hashes} = ?UTILS:pieces_binary_to_list(Pieces_bin),
     % TODO check if the calculated length match the one in the meta info
-    Length = length(Piece_hashes) * Piece_max_length,
+    Length = length(Piece_hashes) * Piece_length,
 
     % URI encoded peer id
-    {peer_id_uri, Peer_id_encoded} = ?SETTINGS_SRV:get_sync(peer_id_uri),
+    {block_length, Block_length} = ?SETTINGS_SRV:get_sync(block_length),
     {download_location, Location} = ?SETTINGS_SRV:get_sync(download_location),
+    {peer_id_uri, Peer_id_encoded} = ?SETTINGS_SRV:get_sync(peer_id_uri),
     {peer_listen_port, Peer_listen_port} = ?SETTINGS_SRV:get_sync(peer_listen_port),
 
     % TODO investigate support for allocate
@@ -276,15 +293,15 @@ init([Metainfo, Start_when_ready]) ->
 
     % Calculate the piece layout over the file structure
     % TODO rename create_file_mapping
-    {ok, Piece_layout} = ?UTILS:create_file_mapping(Resolved_files, Piece_max_length),
+    {ok, Piece_layout} = ?UTILS:create_file_mapping(Resolved_files, Piece_length),
 
     % Create a list with all the piece related information
     Pieces = lists:zipwith(fun(Piece_hash, {Piece_idx,
                                             File_path,
                                             File_offset,
-                                            Piece_length}) ->
+                                            Piece_length2}) ->
                                {Piece_idx, Piece_hash, File_path, File_offset,
-                                Piece_length}
+                                Piece_length2}
                            end, Piece_hashes, Piece_layout),
 
     % THIS SHOULD BE THE END OF THE INITIALIZATION
@@ -293,6 +310,7 @@ init([Metainfo, Start_when_ready]) ->
     ?HASH_SRV:hash_files(Piece_layout),
 
     State = #state{announce = Announce_address,
+                   block_length = Block_length,
                    distributed_rx_pieces = [],
                    downloaded = 0,
                    event = stopped,
@@ -308,6 +326,7 @@ init([Metainfo, Start_when_ready]) ->
                    peers_cur = 0,
                    peers_max = 10,
                    pieces = Pieces,
+                   piece_length = Piece_length,
                    start_when_ready = Start_when_ready,
                    uploaded = 0},
 
@@ -324,6 +343,13 @@ terminate(Reason, _State) ->
 handle_call({get_bitfield}, _From, State) ->
     {reply, State#state.bitfield, State, hibernate};
 
+handle_call({get_block_length}, _From, State) ->
+    {reply, State#state.block_length, State, hibernate};
+
+handle_call({get_piece_length}, _From, State) ->
+    {reply, State#state.piece_length, State, hibernate};
+
+% Old prototype
 handle_call({list}, _From, _State) ->
     io:format("~p list~n",[?MODULE]),
     {ok}.
@@ -349,7 +375,8 @@ handle_cast({torrent_w_request_peers, Peer_amount}, State) ->
                         [?MODULE, ?FUNCTION_NAME, Peers_activate]),
 
             % Tell the peer_s to start the peers
-            ?PEER_SRV:add_rx_peers(State#state.info_hash_bin, Peers_activate),
+            ?PEER_SRV:add_rx_peers(State#state.info_hash_bin, Peers_activate,
+                                   State#state.piece_length),
 
             New_state = State#state{peers_cur = State#state.peers_max,
                                     peers = Peers_rest};
@@ -371,12 +398,17 @@ handle_cast({torrent_w_request_peers, Peer_amount}, State) ->
 handle_cast({torrent_w_request_rx_pieces, From, Peer_bitfield, Piece_number}, State) ->
     lager:debug("~p: ~p: creating piece queue for peer '~p'",
                 [?MODULE, ?FUNCTION_NAME, From]),
+
     % TODO The distribution limit should not be controlled within this function
-    {ok, Pieces, New_distrib_pieces} = ?ALGO:create_piece_queue(Peer_bitfield,
-                                                                State#state.remaining_pieces,
-                                                                State#state.distributed_rx_pieces,
-                                                                1,
-                                                                Piece_number),
+    {ok, Pieces, New_distrib_pieces} = ?ALGO:create_rx_queue(Peer_bitfield,
+                                                             State#state.remaining_pieces,
+                                                             State#state.distributed_rx_pieces,
+                                                             1,
+                                                             Piece_number),
+
+    lager:debug("~p: ~p: assigning pieces to peer '~p'", [?MODULE,
+                                                          ?FUNCTION_NAME,
+                                                          Pieces]),
 
     From ! {torrent_w_rx_pieces, Pieces},
 
@@ -476,7 +508,8 @@ handle_info({tracker_announce, Response}, State) ->
             lager:debug("~p: ~p: peers: '~p'", [?MODULE, ?FUNCTION_NAME, Peer_list]),
 
             % Tell the peer_s to start the peers
-            ?PEER_SRV:add_rx_peers(State#state.info_hash_bin, Peers_activate);
+            ?PEER_SRV:add_rx_peers(State#state.info_hash_bin, Peers_activate,
+                                   State#state.piece_length);
         false ->
             lager:warning("nothing to do here"),
             Peers_rest = Peer_list
@@ -638,14 +671,18 @@ handle_info({hash_s_hash_files_res, {_Job_ID, Hashes}}, State) ->
     % Convert list to bitfield
     {ok, Bitfield} = ?BINARY:list_to_bitfield(Bitfield_list_ordered),
 
+    {ok, Remaining_pieces} = ?ALGO:initial_rx_pieces(Bitfield_list_ordered),
+
     case State#state.start_when_ready of
         true ->
-            Tmp_state = State#state{bitfield = Bitfield},
-            {ok, New_state} = start_torrent(Tmp_state),
-            {noreply, New_state};
+            Tmp_state = State#state{bitfield = Bitfield,
+                                    remaining_pieces = Remaining_pieces},
+            {ok, New_state} = start_torrent(Tmp_state);
         false ->
             New_state = State#state{bitfield = Bitfield,
-                                    state = inactive},
-            {noreply, New_state, hibernate}
-    end.
+                                    remaining_pieces = Remaining_pieces,
+                                    state = inactive}
+    end,
+
+    {noreply, New_state, hibernate}.
 

@@ -1,14 +1,30 @@
 -module(ertorrent_algo_rarest_first).
 
 -export([
-         order_rx_pieces/2,
-         create_piece_queue/5
+         create_rx_queue/5,
+         initial_rx_pieces/1,
+         order_rx_pieces/2
         ]).
 
 -define(BINARY, ertorrent_binary_utils).
 -define(UTILS, ertorrent_utils).
 
-initial_rx_pieces() ->
+initial_rx_pieces(Torrent_bitfield) when is_list(Torrent_bitfield) ->
+    % Add index number to each bit in the bitfield e.g. [{Index, Bit}]
+    {ok, Bits_with_index} = ?UTILS:index_list(Torrent_bitfield),
+
+    Rx_pieces = lists:filtermap(fun({Index, Bit}) ->
+                                    case Bit of
+                                        % None of the pieces should have been
+                                        % distributed yet since this is the
+                                        % initial list. Therefore are
+                                        % occurrences set to 0 for all pieces.
+                                        0 -> {true, {Index, 0}};
+                                        1 -> false
+                                    end
+                                end, Bits_with_index),
+
+    {ok, Rx_pieces}.
 
 
 % Returns a sorted tuple list with the rarest piece being the head of the list.
@@ -49,11 +65,12 @@ order_rx_pieces(Peer_bitfields, Own_bitfield) when is_list(Peer_bitfields) andal
 
     {ok, Filtered}.
 
-create_piece_queue(Peer_bitfield,
-                   Prioritized_pieces,
-                   Distributed_pieces,
-                   Piece_distribution_limit,
-                   Piece_queue_limit) ->
+create_rx_queue(Peer_bitfield,
+                Prioritized_pieces,
+                Distributed_pieces,
+                Piece_distribution_limit,
+                Piece_queue_limit) when
+      is_list(Prioritized_pieces) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 
     % Compile a list with pieces that are currently distributed
@@ -63,19 +80,24 @@ create_piece_queue(Peer_bitfield,
 
     % Filter out the pieces that are already assigned to other peer workers
     WO_limited_pieces = lists:filter(fun({Piece_index, _Occurrences}) ->
-                                         Tmp = not lists:member(Piece_index, Limited_pieces),
-                                         lager:debug("TMP: '~p'", [Tmp]),
-                                         Tmp
+                                         not lists:member(Piece_index, Limited_pieces)
                                      end, Prioritized_pieces),
 
-    % Find the remaining pieces which the peer possess
-    Available_pieces = lists:filtermap(fun({Index, _Occurrences}) ->
-                                           % Check if the peer possess the most relevant piece
-                                           case lists:nth(Index, Peer_bitfield) of
-                                               1 -> true;
-                                               0 -> false
-                                           end
-                                       end, WO_limited_pieces),
+    case Peer_bitfield == undefined of
+        true ->
+            Available_pieces = WO_limited_pieces;
+        false ->
+            % Find the remaining pieces which the peer possess
+            Available_pieces = lists:filtermap(fun({Index, _Occurrences}) ->
+                                                   % Check if the peer possess
+                                                   % the most relevant piece
+                                                   case lists:nth(Index,
+                                                                  Peer_bitfield) of
+                                                       1 -> true;
+                                                       0 -> false
+                                                   end
+                                               end, WO_limited_pieces)
+    end,
 
     % Apply the queue limit
     Pieces_queue_limit = lists:sublist(Available_pieces, Piece_queue_limit),
@@ -86,9 +108,9 @@ create_piece_queue(Peer_bitfield,
     % Update the list of Distributed_pieces with Pieces
     % Start by filter out the tuples for the outdated pieces
     Map = fun({Distrib_index, Distrib_times}, Acc) ->
-              case list:memember(Distrib_index, Acc) of
+              case lists:member(Distrib_index, Acc) of
                   true ->
-                      New_acc = lists:delete(Acc),
+                      New_acc = lists:delete(Distrib_index, Acc),
                       {{Distrib_index, Distrib_times + 1}, New_acc};
                   false ->
                       {{Distrib_index, Distrib_times}, Acc}

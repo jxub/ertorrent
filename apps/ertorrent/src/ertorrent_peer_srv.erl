@@ -10,7 +10,7 @@
 
 -export([
          add_rx_peer/2,
-         add_rx_peers/2,
+         add_rx_peers/3,
          add_tx_peer/2,
          multicast/2,
          remove/1,
@@ -39,18 +39,24 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--record(state, {peers=[],
-                own_peer_id,
-                port_max,
-                port_min}).
+-record(state, {
+                block_length::integer(),
+                peers=[],
+                peer_id::string(),
+                port_max::integer(),
+                port_min::integer()
+               }).
 
 %%% Client API %%%
 add_rx_peer(Info_hash, {Address, Port}) ->
     gen_server:cast(?MODULE, {peer_s_add_rx_peer, self(), {Info_hash, {Address, Port}}}).
 
--spec add_rx_peers(Info_hash::string(), Peers::[tuple()]) -> ok.
-add_rx_peers(Info_hash, Peers) when is_list(Peers) ->
-    gen_server:cast(?MODULE, {peer_s_add_rx_peers, self(), {Info_hash, Peers}}).
+-spec add_rx_peers(Info_hash::string(), Peers::[tuple()],
+                   Piece_length::integer()) -> ok.
+add_rx_peers(Info_hash, Peers, Piece_length) when is_list(Peers) andalso
+                                                  is_integer(Piece_length) ->
+    gen_server:cast(?MODULE, {peer_s_add_rx_peers, self(), {Info_hash, Peers,
+                                                            Piece_length}}).
 
 add_tx_peer(Info_hash, Socket) ->
     gen_server:cast(?MODULE, {peer_s_add_tx_peer, self(), {Socket, Info_hash}}).
@@ -72,9 +78,12 @@ stop() ->
     gen_server:cast(?MODULE, stop).
 
 %%% Internal functions
-start_rx_peer(From, Info_hash, {Address, Port}, Own_peer_id) when is_binary(Info_hash) ->
+start_rx_peer(From, Block_length, Info_hash, Peer_id, Piece_length, {Address,
+                                                                     Port})
+  when is_binary(Info_hash) ->
     ID = erlang:unique_integer(),
-    Ret = ?PEER_SUP:start_child(ID, rx, Info_hash, Own_peer_id, {Address, Port}, From),
+    Ret = ?PEER_SUP:start_child(ID, Block_length, rx, Info_hash, Peer_id,
+                                Piece_length, {Address, Port}, From),
 
     case Ret of
         % TODO Atm the handling of the {ok, _} responses is redundant.
@@ -104,30 +113,34 @@ start_rx_peer(From, Info_hash, {Address, Port}, Own_peer_id) when is_binary(Info
 
 %%% Callback module
 init(_Args) ->
-    {peer_id_str, Own_peer_id} = ?SETTINGS_SRV:get_sync(peer_id_str),
-    {ok, #state{own_peer_id = Own_peer_id}, hibernate}.
+    {block_length, Block_length} = ?SETTINGS_SRV:get_sync(block_length),
+    {peer_id_str, Peer_id} = ?SETTINGS_SRV:get_sync(peer_id_str),
+
+    {ok, #state{block_length = Block_length, peer_id = Peer_id}, hibernate}.
 
 handle_call(Req, From, State) ->
     ?INFO("unhandled call request: " ++ Req ++ ", from: " ++ From),
     {noreply, State}.
 
-handle_cast({peer_s_add_rx_peer, From, {Info_hash, {Address, Port}}}, State) ->
+handle_cast({peer_s_add_rx_peer, From, {Info_hash, Piece_length, {Address, Port}}}, State) ->
     lager:debug("~p: ~p: peer_s_add_rx_peer", [?MODULE, ?FUNCTION_NAME]),
 
-    Ref = start_rx_peer(From, Info_hash, {Address, Port}, State#state.own_peer_id),
+    Ref = start_rx_peer(From, State#state.block_length, Info_hash,
+                        State#state.peer_id, Piece_length, {Address, Port}),
 
     From ! {peer_s_rx_peer, Ref},
 
     {noreply, State, hibernate};
 
-handle_cast({peer_s_add_rx_peers, From, {Info_hash, Peers}}, State) ->
+handle_cast({peer_s_add_rx_peers, From, {Info_hash, Peers, Piece_length}}, State) ->
     lager:debug("~p: ~p: peer_s_add_rx_peers", [?MODULE, ?FUNCTION_NAME]),
 
     % Setup peer connections, succeeding peers will return a reference and
     % failing 'error'.
-    Fold_results = fun(Peer, Acc) ->
-                       Ref = start_rx_peer(From, Info_hash, Peer,
-                                           State#state.own_peer_id),
+    Fold_results = fun(Peer_socket, Acc) ->
+                        Ref = start_rx_peer(From, State#state.block_length,
+                                            Info_hash, State#state.peer_id,
+                                            Piece_length, Peer_socket),
 
                        [Ref| Acc]
                    end,
@@ -188,7 +201,7 @@ handle_cast({add_tx_peer, From, {Socket, Info_hash}}, State) ->
     case ?TORRENT_SRV:member_by_info_hash(Info_hash) of
         true ->
             case ?PEER_SUP:start_child(ID, tx, Info_hash,
-                                       State#state.own_peer_id,
+                                       State#state.peer_id,
                                        {socket, Socket}, From) of
                 {ok, Peer_pid} ->
                     New_state = State#state{peers=[{ID,

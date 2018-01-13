@@ -39,6 +39,7 @@ init(_Args) ->
     Peer_id_encoded = http_uri:encode(Peer_id),
 
     Settings = [
+        {block_length, 16000}, % 16kb
         {download_location,"~/ertorrent/downloads"},
         {peer_id_str,Peer_id},
         {peer_id_uri,Peer_id_encoded},

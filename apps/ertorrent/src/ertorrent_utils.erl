@@ -49,7 +49,8 @@ unify_file_list(File_paths) ->
 
     {ok, lists:reverse(Result)}.
 
-block_offsets(Block_size, Piece_size) ->
+block_offsets(Block_size, Piece_size) when is_integer(Block_size) andalso
+                                           is_integer(Piece_size) ->
     % 0 will be included so remove one to keep the actual amount
     Whole_blocks = lists:seq(0, Piece_size, Block_size),
 
@@ -67,7 +68,7 @@ block_offsets(Block_size, Piece_size) ->
             % The trailing block is after the last whole block
             {Last_offset, Last_length} = lists:last(Block_length),
 
-            Rem_offset = Last_offset * Last_length,
+            Rem_offset = Last_offset + Last_length,
             Rem_list = [{Rem_offset, Rem_size}],
 
             % Add the trailing block to the whole block offsets
