@@ -31,18 +31,16 @@ init(_Args) ->
     % Look for configuration file in /etc
     % Look for configuration file in ~/.ertorrent
 
-    % Generate a unique id
+    % Generate a unique id. 12 bytes together with the six characters from the
+    % prefix will result in total 20 characters when encoded.
     Id_bin = crypto:strong_rand_bytes(14),
     Id_str = binary_to_list(Id_bin),
     Peer_id = lists:concat(["ET001-", Id_str]),
-    % Replacing reserved characters
-    Peer_id_encoded = http_uri:encode(Peer_id),
 
     Settings = [
         {block_length, 16000}, % 16kb
         {download_location,"~/ertorrent/downloads"},
-        {peer_id_str,Peer_id},
-        {peer_id_uri,Peer_id_encoded},
+        {peer_id, Peer_id},
         {peer_listen_port,35400}
     ],
 

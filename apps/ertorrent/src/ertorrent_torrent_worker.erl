@@ -172,7 +172,7 @@ tracker_announce_loop(State) ->
 
     Announce = fun() ->
                    ?TRACKER:announce2(State#state.announce,
-                                      State#state.info_hash_str,
+                                      State#state.info_hash_bin,
                                       State#state.peer_id,
                                       State#state.peer_listen_port,
                                       State#state.uploaded,
@@ -265,7 +265,7 @@ init([Metainfo, Start_when_ready]) ->
     % URI encoded peer id
     {block_length, Block_length} = ?SETTINGS_SRV:get_sync(block_length),
     {download_location, Location} = ?SETTINGS_SRV:get_sync(download_location),
-    {peer_id_uri, Peer_id_encoded} = ?SETTINGS_SRV:get_sync(peer_id_uri),
+    {peer_id, Peer_id} = ?SETTINGS_SRV:get_sync(peer_id),
     {peer_listen_port, Peer_listen_port} = ?SETTINGS_SRV:get_sync(peer_listen_port),
 
     % TODO investigate support for allocate
@@ -311,6 +311,7 @@ init([Metainfo, Start_when_ready]) ->
 
     State = #state{announce = Announce_address,
                    block_length = Block_length,
+                   compact = 1,
                    distributed_rx_pieces = [],
                    downloaded = 0,
                    event = stopped,
@@ -321,7 +322,7 @@ init([Metainfo, Start_when_ready]) ->
                    left = Length,
                    length = Length,
                    metainfo = Metainfo,
-                   peer_id = Peer_id_encoded,
+                   peer_id = Peer_id,
                    peer_listen_port = Peer_listen_port,
                    peers_cur = 0,
                    peers_max = 10,

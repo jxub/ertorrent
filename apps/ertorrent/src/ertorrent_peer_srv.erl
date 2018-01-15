@@ -114,7 +114,7 @@ start_rx_peer(From, Block_length, Info_hash, Peer_id, Piece_length, {Address,
 %%% Callback module
 init(_Args) ->
     {block_length, Block_length} = ?SETTINGS_SRV:get_sync(block_length),
-    {peer_id_str, Peer_id} = ?SETTINGS_SRV:get_sync(peer_id_str),
+    {peer_id, Peer_id} = ?SETTINGS_SRV:get_sync(peer_id),
 
     {ok, #state{block_length = Block_length, peer_id = Peer_id}, hibernate}.
 

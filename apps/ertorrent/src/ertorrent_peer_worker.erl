@@ -379,10 +379,9 @@ send_bitfield(Socket, Bitfield) ->
     gen_tcp:send(Socket, Bitfield_msg).
 
 send_handshake(Socket, Peer_id_str, Torrent_info_bin) ->
-    lager:debug("PEER_ID: '~p'", [Peer_id_str]),
-    Peer_id = list_to_binary(Peer_id_str),
+    Peer_id_bin = list_to_binary(Peer_id_str),
     {ok, Handshake} = ?PEER_PROTOCOL:msg_handshake(Torrent_info_bin,
-                                                   Peer_id),
+                                                   Peer_id_bin),
     gen_tcp:send(Socket, Handshake).
 
 send_message(Socket, Message, State) ->
@@ -581,8 +580,6 @@ handle_info({message_retry_loop}, State) ->
 
     Max_attempts = Old_retry#retry.max_attempts,
 
-    lager:debug("OLD RETRTY: '~p'", [Old_retry]),
-
     Foldl = fun(Entry, Acc) ->
                 {Fun, Message, Attempts} = Entry,
                 {Socket, Retry_list} = Acc,
@@ -614,7 +611,7 @@ handle_info({message_retry_loop}, State) ->
     New_retry = Old_retry#retry{queue = New_retries},
 
     % If _any_ of the retries result in an error, terminate the peer
-    case lists:member(error, 1, New_retries) of
+    case lists:member(error, New_retries) of
         false ->
             % Check if theres any queued requests left, otherwise don't refresh the
             % timer.
@@ -703,17 +700,15 @@ handle_info({torrent_w_rx_pieces, Pieces}, State) ->
             % The block offsets is the same for each piece so lets put them together in
             % a tuplelist.
             Add_rx_queue = [{Piece_index, Block_offset, Block_length} ||
-                            {Block_offset, Block_length} <- Block_offsets,
-                            Piece_index <- Pieces],
+                            Piece_index <- Pieces,
+                            {Block_offset, Block_length} <- Block_offsets],
 
             Old_retry = State#state.retry,
             Old_retry_queue = Old_retry#retry.queue,
 
             {ok, Selection} = prepare_request_selection(Add_rx_queue, 5),
 
-            New_retry_queue = [Selection| Old_retry_queue],
-
-            lager:debug("NEW QUEUE: '~p'", [New_retry_queue]),
+            New_retry_queue = lists:merge(Selection, Old_retry_queue),
 
             Retry = Old_retry#retry{queue = New_retry_queue},
 
@@ -724,7 +719,6 @@ handle_info({torrent_w_rx_pieces, Pieces}, State) ->
                                     self_choked = false,
                                     self_interested = true},
 
-            lager:debug("INITIALIZING RETRY: '~p'", [Retry]),
             self() ! {message_retry_loop},
 
             {noreply, New_state, hibernate};
