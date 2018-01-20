@@ -38,7 +38,7 @@ init(_Args) ->
     Peer_id = lists:concat(["ET001-", Id_str]),
 
     Settings = [
-        {block_length, 16000}, % 16kb
+        {block_length, math:pow(2, 14)}, % 16kb
         {download_location,"~/ertorrent/downloads"},
         {peer_id, Peer_id},
         {peer_listen_port,35400}

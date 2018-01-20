@@ -1,15 +1,15 @@
 -module(ertorrent_algo_rarest_first).
 
 -export([
-         create_rx_queue/5,
-         initial_rx_pieces/1,
-         order_rx_pieces/2
+         rx_next/5,
+         rx_init/1,
+         rx_update/2
         ]).
 
 -define(BINARY, ertorrent_binary_utils).
 -define(UTILS, ertorrent_utils).
 
-initial_rx_pieces(Torrent_bitfield) when is_list(Torrent_bitfield) ->
+rx_init(Torrent_bitfield) when is_list(Torrent_bitfield) ->
     % Add index number to each bit in the bitfield e.g. [{Index, Bit}]
     {ok, Bits_with_index} = ?UTILS:index_list(Torrent_bitfield),
 
@@ -29,9 +29,11 @@ initial_rx_pieces(Torrent_bitfield) when is_list(Torrent_bitfield) ->
 
 % Returns a sorted tuple list with the rarest piece being the head of the list.
 % E.g. [{Piece_index, Piece_occurrences}]
-order_rx_pieces(Peer_bitfields, Own_bitfield) when is_list(Peer_bitfields) andalso
-                                                   is_list(Own_bitfield)->
-
+rx_update(Own_bitfield, Peer_bitfields) when
+      is_list(Own_bitfield) andalso
+      length(Own_bitfield) > 0 andalso
+      is_list(Peer_bitfields) andalso
+      length(Peer_bitfields) > 0 ->
     lager:debug("~p: ~p: peer bitfields '~p'", [?MODULE, ?FUNCTION_NAME, Peer_bitfields]),
     lager:debug("~p: ~p: own bitfield '~p'", [?MODULE, ?FUNCTION_NAME, Own_bitfield]),
 
@@ -47,6 +49,8 @@ order_rx_pieces(Peer_bitfields, Own_bitfield) when is_list(Peer_bitfields) andal
 
     % Sorting the summary
     Rarest_first = lists:keysort(2, Sum_with_idx),
+
+    lager:debug("ERROR?! Rarest: '~p', Own bf '~p'", [length(Rarest_first), length(Own_bitfield)]),
 
     % Zip with the own bitfield
     Zipped = lists:zipwith(fun({Index, Occurrences}, Bit) ->
@@ -65,11 +69,11 @@ order_rx_pieces(Peer_bitfields, Own_bitfield) when is_list(Peer_bitfields) andal
 
     {ok, Filtered}.
 
-create_rx_queue(Peer_bitfield,
-                Prioritized_pieces,
-                Distributed_pieces,
-                Piece_distribution_limit,
-                Piece_queue_limit) when
+rx_next(Peer_bitfield,
+        Prioritized_pieces,
+        Distributed_pieces,
+        Piece_distribution_limit,
+        Piece_queue_limit) when
       is_list(Prioritized_pieces) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 

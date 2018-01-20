@@ -164,7 +164,12 @@ stop(Name) when is_atom(Name) ->
 tracker_announce_loop(State) ->
     case is_reference(State#state.announce_ref) of
         true ->
-            erlang:cancel_timer(announce_ref);
+            % Added the try catch after cancel_timer was failing
+            try erlang:cancel_timer(State#state.announce_ref) of
+                _ -> ok
+            catch
+                _ -> lager:debug("~p: ~p: failed to cancel timer")
+            end;
         _ ->
             lager:debug("~p: ~p: no timer to cancel",
                         [?MODULE, ?FUNCTION_NAME])
@@ -232,6 +237,13 @@ start_torrent(State) ->
                                       event = started,
                                       state = active},
     {ok, New_state}.
+
+update_rx_pieces(Own_bitfield, []) when is_list(Own_bitfield) ->
+    ?ALGO:rx_init(Own_bitfield);
+update_rx_pieces(Own_bitfield, Peer_bitfields) when
+      is_list(Own_bitfield) andalso
+      is_list(Peer_bitfields) ->
+    ?ALGO:rx_update(Own_bitfield, Peer_bitfields).
 
 %%% Callback functions
 % TODO:
@@ -337,6 +349,8 @@ init([Metainfo, Start_when_ready]) ->
 
 terminate(Reason, _State) ->
     io:format("~p: going down, with reason '~p'~n", [?MODULE, Reason]),
+
+    % Add announce with event=stopped
     ok.
 
 %% Synchronous
@@ -401,11 +415,11 @@ handle_cast({torrent_w_request_rx_pieces, From, Peer_bitfield, Piece_number}, St
                 [?MODULE, ?FUNCTION_NAME, From]),
 
     % TODO The distribution limit should not be controlled within this function
-    {ok, Pieces, New_distrib_pieces} = ?ALGO:create_rx_queue(Peer_bitfield,
-                                                             State#state.remaining_pieces,
-                                                             State#state.distributed_rx_pieces,
-                                                             1,
-                                                             Piece_number),
+    {ok, Pieces, New_distrib_pieces} = ?ALGO:rx_next(Peer_bitfield,
+                                                     State#state.remaining_pieces,
+                                                     State#state.distributed_rx_pieces,
+                                                     1,
+                                                     Piece_number),
 
     lager:debug("~p: ~p: assigning pieces to peer '~p'", [?MODULE,
                                                           ?FUNCTION_NAME,
@@ -548,8 +562,8 @@ handle_info({peer_w_rx_bitfield, ID, Bitfield}, State) ->
 
     New_bitfields = [{ID, Bitfield}| State#state.bitfields],
 
-    {ok, Remaining_pieces} = ?ALGO:order_rx_pieces(New_bitfields,
-                                                   Bitfield_list),
+    {ok, Remaining_pieces} = update_rx_pieces(Bitfield_list,
+                                              New_bitfields),
 
     New_state = State#state{bitfields = New_bitfields,
                             remaining_pieces = Remaining_pieces},
@@ -603,14 +617,14 @@ handle_info({file_w_write_offset_res, _From, {_Info_hash, _Piece_idx}}, State) -
 % up a new peer worker if it's necessary.
 % @end
 % TODO This should probably be moved to peer_s
-handle_info({peer_w_terminate, ID, _Current_piece_index}, State) ->
+handle_info({peer_w_terminate, ID, Assigned_pieces}, State) when is_list(Assigned_pieces) ->
     lager:debug("~p: ~p: peer_w_terminate", [?MODULE, ?FUNCTION_NAME]),
 
     % Remove the peer_w's bitfield
     case lists:keytake(ID, 1, State#state.bitfields) of
         {value, {ID, _Bitfield}, New_bitfields} ->
             {ok, Bitfield_list} = ?BINARY:bitfield_to_list(State#state.bitfield),
-            Remaining_pieces = ?ALGO:order_rx_pieces(State#state.bitfields, Bitfield_list),
+            {ok, Remaining_pieces} = update_rx_pieces(Bitfield_list, New_bitfields),
             New_bitfields;
         % Whenever a peer_w terminate before receiving a bitfield
         false ->
@@ -619,9 +633,7 @@ handle_info({peer_w_terminate, ID, _Current_piece_index}, State) ->
     end,
 
     % TODO
-    % - trigger an update of the algorithm module
-
-    % Add the assigned piece index to the list again if it wasn't finished
+    % Re-add the assigned piece indices to the list again if it wasn't finished
 
     % Fire up a new peer_w
     ok = request_peers(self(), 1),
@@ -672,7 +684,7 @@ handle_info({hash_s_hash_files_res, {_Job_ID, Hashes}}, State) ->
     % Convert list to bitfield
     {ok, Bitfield} = ?BINARY:list_to_bitfield(Bitfield_list_ordered),
 
-    {ok, Remaining_pieces} = ?ALGO:initial_rx_pieces(Bitfield_list_ordered),
+    {ok, Remaining_pieces} = update_rx_pieces(Bitfield_list_ordered, []),
 
     case State#state.start_when_ready of
         true ->

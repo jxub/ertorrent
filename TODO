@@ -9,14 +9,7 @@ Questions:
 - Check out edown if it could be used for documentation?
 
 General:
-- Find out why we stopped getting handshakes and if there is any extension with
-  an alternative handshake method.
 - Read up on OS-specifics http://erlang.org/doc/man/os.html#type-0
-- Figure out start up order. settings sup.tree needs to start up first so that
-  torrent_ssup can get port settings.
-- Investigate of there should be a sup for hash otherwise rename sup -> ssup
-- Investigate of there should be a sup for tracker otherwise rename sup -> ssup
-- Update ertorrent_sup with new ssups
 - Move knowledge about the incoming peer port form the torrent sup.tree. It was
   originially placed there, so that the torrent_worker could embed it into the
   tracker messages. The torrent_worker should only send the tracker_worker with
@@ -37,15 +30,6 @@ General:
   part of the tracker announcement
 - TERMS Decide on a term for torrent start_when_ready feature, state =
   "active"?
-
-http_dispatcher:
-- Investigate the issue when we sometimes receive an error related to decoding
-  the announce data because we get an HTML response with a bad request page.
-  The request from announce2 is never reaching it's destination and bounce on
-  the local network, alternatively failing to setup a socket to the tracker and
-  we receive a default response. REASON: We don't URL encode the peer id
-  properly and in some cases we get an invalid seed when generating the peer
-  id.
 
 file_srv:
 - Implement handle_info({file_w_pread_resp
@@ -85,21 +69,11 @@ peer_accept:
 - Handle Reason in terminate/2
 
 peer_worker:
-- Add serialization of Data in handle_info({peer_srv_piece, ...})
-- handle_info({peer_srv_piece, ...}) fix return value
-- Check difference between handle_info({peer_srv_piece, Data} and
-  handle_info({peer_srv_piece, _Index, _Hash, Data}, State).
+- Send queued request when we receive unchoke from the peer
 - Look up if it's necessary to verify the Socket in messages from gen_tcp, e.g.
   handle_info({tcp, Socket, Data})
 - handle_info({tcp, _S, <<19:32, "BitTorrent protocol", 0:64, Info_hash:160,
   Peer_id:160>>}, State), add verification of the Peer_id
-- Figure out when it is safe to clear out cached pieces (when the pieces are
-  completely transfered to the peer). Is it safe to assume that we'll receive a
-  HAVE message?
-- Rename incoming/outgoing piece entries in the state record to rx/tx
-- Rename cached_requests in the state record to buffered_requests
-- Add default values to the peer_state record since this is covered by the
-  bittorrent protocol specification
 
 utils:
 - Sort the functions in this module

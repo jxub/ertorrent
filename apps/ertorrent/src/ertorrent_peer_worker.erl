@@ -35,6 +35,12 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
+-record(rx_data, {
+                  dispatched::list(),
+                  prepared::list(),
+                  received::list()
+                 }).
+
 -record(retry, {
                 max_attempts::integer(),
                 queue::list(),
@@ -43,6 +49,7 @@
 
 -record(state, {
                 address,
+                assigned_pieces::list(),
                 block_length,
                 dht_port,
                 id, % peer_worker_id
@@ -77,6 +84,7 @@
                 retry_ref,
                 request_buffer::list(),
                 rx_queue::list(),
+                rx_data::#rx_data{},
                 socket,
                 self_choked::boolean(),
                 self_interested::boolean(),
@@ -384,22 +392,13 @@ send_handshake(Socket, Peer_id_str, Torrent_info_bin) ->
                                                    Peer_id_bin),
     gen_tcp:send(Socket, Handshake).
 
-send_message(Socket, Message, State) ->
-    case State#state.peer_choked and
-         State#state.peer_interested and
-         State#state.self_choked and
-         State#state.self_interested of
-        true ->
-            case gen_tcp:send(Socket, Message) of
-                ok ->
-                    ok;
-                {error, Reason} ->
-                    lager:debug("~p: ~p: reason '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
-                    error
-            end;
-        false ->
-            lager:debug("~p: ~p: invalid states for sending", [?MODULE, ?FUNCTION_NAME]),
-            not_ready
+dispatch(Socket, Message) ->
+    case gen_tcp:send(Socket, Message) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            lager:debug("~p: ~p: reason '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
+            error
     end.
 
 send_interested(Socket) ->
@@ -433,6 +432,43 @@ send_request(Socket, {Piece_index, Begin, Length}, State) ->
 
     send_message(Socket, Message, State).
 
+send_requests(State) ->
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
+
+    Rx_data = State#state.rx_data,
+
+
+    Foldl = fun(Entry, Acc) ->
+                {Fun, Message, Attempts} = Entry,
+                {Socket, Retry_list} = Acc,
+
+                case Fun(Socket, Message, State) of
+                    % Successfully sent the piece request
+                    ok ->
+                        New_retry_list = Retry_list;
+                    error ->
+                        lager:debug("~p: ~p: failed to send message to peer, terminating peer",
+                                    [?MODULE, ?FUNCTION_NAME]),
+                        New_retry_list = [error| Retry_list]
+                end,
+
+                {Socket, New_retry_list}
+            end,
+    {_Socket, New_retries} = lists:foldl(Foldl, {State#state.socket, []}, Rx_data#rx_data.prepared),
+
+    New_dispatched = lists:concat(Rx_data#rx_data.dispatched,
+                                  Rx_data#rx_data.prepared),
+    New_rx_data = Rx_data#rx_data{prepared = []}
+
+    % If _any_ of the retries result in an error, terminate the peer
+    case lists:member(error, New_retries) of
+        false ->
+            {noreply, New_state, hibernate};
+        true ->
+            {stop, normal, State}
+    end;
+
+
 %%% Callback module
 init([ID, Block_length, Mode, Info_hash, Peer_id, Piece_length, {Address, Port}, Torrent_pid])
       when is_integer(ID)
@@ -447,30 +483,40 @@ init([ID, Block_length, Mode, Info_hash, Peer_id, Piece_length, {Address, Port},
                 [?MODULE, ?FUNCTION_NAME, ID, Block_length, Mode, Info_hash, Peer_id, Piece_length]),
 
     % Assigning default values for retries
-    Retry = #retry{max_attempts = 300,
+    Retry = #retry{
+                   max_attempts = 300,
                    queue = [],
-                   timer = 100},
+                   timer = 100
+                  },
+
+    Rx_data = #rx_data{
+                       dispatched = [],
+                       prepared = [],
+                       received = []
+                      }
 
     {ok, #state{
-                 id = ID,
-                 address = Address,
-                 block_length = Block_length,
-                 mode = Mode,
-                 peer_id = Peer_id, % TODO Should this be retreived from settings_srv?
-                 peer_choked = true,
-                 peer_interested = false,
-                 piece_length = Piece_length,
-                 port = Port,
-                 received_handshake = false,
-                 retry = Retry,
-                 rx_queue = [],
-                 self_choked = true,
-                 self_interested = false,
-                 sent_handshake = false,
-                 torrent_info_hash_bin = Info_hash,
-                 torrent_pid = Torrent_pid},
-                 hibernate
-                }.
+                address = Address,
+                assigned_pieces = [],
+                id = ID,
+                block_length = Block_length,
+                mode = Mode,
+                peer_id = Peer_id, % TODO Should this be retreived from settings_srv?
+                peer_choked = true,
+                peer_interested = false,
+                piece_length = Piece_length,
+                port = Port,
+                received_handshake = false,
+                retry = Retry,
+                rx_data = Rx_data,
+                rx_queue = [],
+                self_choked = true,
+                self_interested = false,
+                sent_handshake = false,
+                torrent_info_hash_bin = Info_hash,
+                torrent_pid = Torrent_pid},
+                hibernate
+               }.
 
 terminate(Reason, State) ->
     lager:debug("~p: ~p: terminating, reason: '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
@@ -498,7 +544,7 @@ terminate(Reason, State) ->
 
     State#state.torrent_pid ! {peer_w_terminate,
                                State#state.id,
-                               State#state.incoming_piece_index},
+                               State#state.assigned_pieces},
 
     ok.
 
@@ -561,7 +607,8 @@ handle_cast(Request, State) ->
 
 %% Timeout for when a keep alive message was expected from the peer
 handle_info({keep_alive_rx_timeout}, State) ->
-    {stop, peer_worker_timed_out, State, hibernate};
+    lager:debug("~p: ~p: peer timed out", [?MODULE, ?FUNCTION_NAME]),
+    {stop, normal, State};
 
 %% Time to send another keep alive before the peer mark us as inactive
 handle_info({keep_alive_tx_timeout}, State) ->
@@ -570,14 +617,17 @@ handle_info({keep_alive_tx_timeout}, State) ->
             New_state = State#state{keep_alive_tx_ref=Timer_ref},
             {noreply, New_state, hibernate};
         {error, Reason} ->
-            {stop, Reason, State}
+            lager:debug("~p: ~p: failed to send timeout: '~p'", [?MODULE,
+                                                                 ?FUNCTION_NAME,
+                                                                 Reason]),
+            {stop, normal, State}
     end;
 
 % TODO when this is used make sure to cancel the retry reference
 handle_info({message_retry_loop}, State) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
-    Old_retry = State#state.retry,
 
+    Old_retry = State#state.retry,
     Max_attempts = Old_retry#retry.max_attempts,
 
     Foldl = fun(Entry, Acc) ->
@@ -706,7 +756,7 @@ handle_info({torrent_w_rx_pieces, Pieces}, State) ->
             Old_retry = State#state.retry,
             Old_retry_queue = Old_retry#retry.queue,
 
-            {ok, Selection} = prepare_request_selection(Add_rx_queue, 5),
+            {ok, Selection} = prepare_request_selection(Add_rx_queue, 10),
 
             New_retry_queue = lists:merge(Selection, Old_retry_queue),
 
@@ -714,12 +764,16 @@ handle_info({torrent_w_rx_pieces, Pieces}, State) ->
 
             New_rx_queue = State#state.rx_queue ++ Add_rx_queue,
 
-            New_state = State#state{retry = Retry,
+            Rx_data = State#state.rx_data,
+            Prepared = lists:merge(Rx_data.prepared, Selection),
+            New_rx_data = Rx_data#rx_data{prepared = Prepared},
+
+            New_state = State#state{assigned_pieces = Pieces,
+                                    retry = Retry,
+                                    rx_data = New_rx_data,
                                     rx_queue = New_rx_queue,
                                     self_choked = false,
                                     self_interested = true},
-
-            self() ! {message_retry_loop},
 
             {noreply, New_state, hibernate};
         false ->
