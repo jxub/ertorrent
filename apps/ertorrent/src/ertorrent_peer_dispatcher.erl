@@ -2,7 +2,10 @@
 -behaviour(gen_statem).
 
 -export([
-         start_link/0,
+         choke/1,
+         unchoke/1,
+         feed/2,
+         start_link/1,
          stop/1
         ]).
 
@@ -13,60 +16,103 @@
          callback_mode/0
         ]).
 
+% State name callback functions
+-export([
+         idle/3,
+         run/3
+        ]).
+
 -record(data, {
-               rx_queue::list()
+               queue::list()
               }).
+-type data()::#data{}.
+
+%%% Module API
+
+choke(ID) ->
+    gen_statem:cast(ID, choke).
+
+unchoke(ID) ->
+    gen_statem:cast(ID, unchoke).
+
+feed(ID, Queue) when is_list(Queue) ->
+    gen_statem:cast(ID, {feed, Queue}).
 
 start_link(ID) ->
     gen_statem:start_link({local, ID}, ?MODULE, [], []).
 
-init([Args]) ->
-    State = off,
-    Data = 0,
+stop(ID) ->
+    gen_statem:cast(ID, stop).
+
+dispatch([]) ->
+    ok;
+dispatch([H| Rest]) ->
+    io:format("~p: dispatching '~p'~n", [?FUNCTION_NAME, H]),
+    dispatch(Rest).
+
+%%% Behaviour callback functions
+
+init([]) ->
+    State = idle,
+    Data = #data{queue = []},
     {ok, State, Data}.
 
-terminate(_Reason, State, Data) ->
+terminate(_Reason, _State, _Data) ->
     normal.
 
 callback_mode() ->
     state_functions.
 
-% State callback functions
+%%% State name callback functions
 
-choked(choked, Old_state, Data) ->
-    io:format("choked", []),
-    {next_state, idle, Data};
-choked(Event_type, Event_content, Data) ->
-    handle_event(Event_type, Event_content, Data).
-
-unchoked(unchoked, Old_state, Data) ->
-    io:format("unchoked", []),
-    {next_state, dispatch, Data};
-unchoked(Event_type, Event_content, Data) ->
-    handle_event(Event_type, Event_content, Data).
-
-feed(feed, Old_state, Data) ->
-    io:format("feeding", []),
-    ok;
-feed(Event_type, Event_content, Data) ->
-    handle_event(Event_type, Event_content, Data).
-
-dispatch(dispatch, Old_state, Data) ->
-    io:format("dispatching", []),
-
-    case 
-    ok;
-dispatch(Event_type, Event_content, Data) ->
-    handle_event(Event_type, Event_content, Data).
-
-idle(idle, Old_state, Data) ->
+-spec idle(choke, _Old_state::atom(), Data::data()) -> {keep_state,
+                                                        Data::data()} |
+                                                       {next_state, run,
+                                                        Data::data()}.
+idle(cast, choke, Data) ->
+    {keep_state, Data};
+idle(cast, unchoke, Data) ->
     io:format("idling", []),
-    {keep_state, Data, };
+
+    case Data#data.queue == [] of
+        false ->
+            {next_state, run, Data};
+        true ->
+            {keep_state, Data}
+    end;
 idle(Event_type, Event_content, Data) ->
     handle_event(Event_type, Event_content, Data).
 
-clear(clear, Old_state, Data) ->
-    io:format("clearing", []),
-    ok;
-clear(Event_type, Event_content, Data) ->
+run(cast, choke, Data) ->
+    io:format("run cast choke~n", []),
+    {next_state, idle, Data};
+run(cast, unchoke, Data) ->
+    io:format("run cast unchoke~n", []),
+
+    case Data#data.queue == [] of
+        false ->
+            ok = dispatch(Data#data.queue),
+            {next_state, idle, #data{queue = []}};
+        true ->
+            {next_state, idle, Data}
+    end;
+run(Event_type, Event_content, Data) ->
     handle_event(Event_type, Event_content, Data).
+
+%%% State common events
+
+% @doc Refilling the dispatch queue
+% @end
+handle_event(cast, {feed, Queue}, Data) ->
+    io:format("~p: feed", [?FUNCTION_NAME]),
+    New_queue = lists:merge(Queue, Data#data.queue),
+    New_data = Data#data{queue = New_queue},
+    {keep_state, New_data};
+
+handle_event(cast, stop, Data) ->
+    io:format("~p: stop", [?FUNCTION_NAME]),
+    {stop, normal, Data};
+
+% Catching everything else
+handle_event(_EventType, _EventContent, Data) ->
+    {keep_state, Data}.
