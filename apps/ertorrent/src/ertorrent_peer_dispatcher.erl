@@ -26,6 +26,14 @@
                queue::list()
               }).
 -type data()::#data{}.
+-type event_content()::choke | unchoke | stop | {feed, Queue::list()}.
+-type idle_result()::{keep_state, Data::data()} |
+        {next_state, run, Data::data()} |
+        {next_state, run, Data::data(), [{next_event, cast, unchoke}]} |
+        {repeat_state, Data::data()}.
+-type run_result()::{keep_state, Data::data()} |
+        {next_state, idle, Data::data()} |
+        {next_state, idle, Data::data(), [{next_event, cast, unchoke}]}.
 
 %%% Module API
 
@@ -52,12 +60,14 @@ dispatch([H| Rest]) ->
 
 %%% Behaviour callback functions
 
-init([]) ->
+-spec init(Args::list()) -> {ok, idle, data()}.
+init(_Args) ->
     State = idle,
     Data = #data{queue = []},
     {ok, State, Data}.
 
 terminate(_Reason, _State, _Data) ->
+    % TODO return the remaining queue, if there is one, when terminating
     normal.
 
 callback_mode() ->
@@ -65,52 +75,58 @@ callback_mode() ->
 
 %%% State name callback functions
 
--spec idle(choke, _Old_state::atom(), Data::data()) -> {keep_state,
-                                                        Data::data()} |
-                                                       {next_state, run,
-                                                        Data::data()}.
+-spec idle(cast, Old_state::event_content(), Data::data()) -> idle_result().
 idle(cast, choke, Data) ->
+    lager:debug("~p: ~p: choke", [?MODULE, ?FUNCTION_NAME]),
     {keep_state, Data};
 idle(cast, unchoke, Data) ->
-    io:format("idling", []),
-
+    lager:debug("~p: ~p: unchoke", [?MODULE, ?FUNCTION_NAME]),
     case Data#data.queue == [] of
         false ->
-            {next_state, run, Data};
+            {next_state, run, Data, [{next_event, cast, unchoke}]};
         true ->
             {keep_state, Data}
     end;
+idle(cast, {feed, Queue}, Data) ->
+    lager:debug("~p: ~p: feed '~p'", [?MODULE, ?FUNCTION_NAME, Queue]),
+    New_queue = lists:merge(Queue, Data#data.queue),
+    % Refilling the dispatch queue and continue to idle.
+    New_data = Data#data{queue = New_queue},
+    {repeat_state, New_data};
 idle(Event_type, Event_content, Data) ->
     handle_event(Event_type, Event_content, Data).
 
+-spec run(cast, Old_state::event_content(), Data::data()) -> run_result().
 run(cast, choke, Data) ->
-    io:format("run cast choke~n", []),
+    lager:debug("~p: ~p: choke", [?MODULE, ?FUNCTION_NAME]),
     {next_state, idle, Data};
 run(cast, unchoke, Data) ->
-    io:format("run cast unchoke~n", []),
+    lager:debug("~p: ~p: unchoke", [?MODULE, ?FUNCTION_NAME]),
 
     case Data#data.queue == [] of
         false ->
             ok = dispatch(Data#data.queue),
-            {next_state, idle, #data{queue = []}};
+            {keep_state, #data{queue = []}};
         true ->
-            {next_state, idle, Data}
+            {keep_state, Data}
     end;
+run(cast, {feed, Queue}, Data) ->
+    lager:debug("~p: ~p: feed '~p'", [?MODULE, ?FUNCTION_NAME, Queue]),
+
+    New_queue = lists:merge(Queue, Data#data.queue),
+    New_data = Data#data{queue = New_queue},
+
+    % Since current state is 'run' it is safe to assume that the previous event
+    % is unchoke. By changing state to idle and emit another event another
+    % dispatch should be triggered.
+    {next_state, idle, New_data, [{next_event, cast, unchoke}]};
 run(Event_type, Event_content, Data) ->
     handle_event(Event_type, Event_content, Data).
 
 %%% State common events
 
-% @doc Refilling the dispatch queue
-% @end
-handle_event(cast, {feed, Queue}, Data) ->
-    io:format("~p: feed", [?FUNCTION_NAME]),
-    New_queue = lists:merge(Queue, Data#data.queue),
-    New_data = Data#data{queue = New_queue},
-    {keep_state, New_data};
-
 handle_event(cast, stop, Data) ->
-    io:format("~p: stop", [?FUNCTION_NAME]),
+    lager:debug("~p: ~p: stop", [?MODULE, ?FUNCTION_NAME]),
     {stop, normal, Data};
 
 % Catching everything else
