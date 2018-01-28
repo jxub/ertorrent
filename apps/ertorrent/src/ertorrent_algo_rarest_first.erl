@@ -9,6 +9,11 @@
 -define(BINARY, ertorrent_binary_utils).
 -define(UTILS, ertorrent_utils).
 
+% @doc Creating a tuple list of pieces that is missing based on the torrent
+% bitfield. This function is used before we receive the peer's bitfield.
+% output: [{Index0, Distributed0}, {Index1, Distributed0}]
+% @end
+-spec rx_init(Torrent_bitfield::list()) -> list().
 rx_init(Torrent_bitfield) when is_list(Torrent_bitfield) ->
     % Add index number to each bit in the bitfield e.g. [{Index, Bit}]
     {ok, Bits_with_index} = ?UTILS:index_list(Torrent_bitfield),
@@ -29,6 +34,9 @@ rx_init(Torrent_bitfield) when is_list(Torrent_bitfield) ->
 
 % Returns a sorted tuple list with the rarest piece being the head of the list.
 % E.g. [{Piece_index, Piece_occurrences}]
+% TODO See if there is a type for tuple list then replace the return in spec
+% with tuple list.
+-spec rx_update(Own_bitfield::list(), Peer_bitfield::list()) -> list().
 rx_update(Own_bitfield, Peer_bitfields) when
       is_list(Own_bitfield) andalso
       length(Own_bitfield) > 0 andalso
@@ -69,11 +77,14 @@ rx_update(Own_bitfield, Peer_bitfields) when
 
     {ok, Filtered}.
 
+-spec rx_next() -> ok.
+% TODO Add Last_index so we can pack that piece in a tuple e.g. {Index, last} so that the peer can calculate the block offsets for the last piece since it most likely will be smaller than a regular piece.
 rx_next(Peer_bitfield,
         Prioritized_pieces,
         Distributed_pieces,
         Piece_distribution_limit,
-        Piece_queue_limit) when
+        Piece_queue_limit,
+        Last_index) when
       is_list(Prioritized_pieces) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 

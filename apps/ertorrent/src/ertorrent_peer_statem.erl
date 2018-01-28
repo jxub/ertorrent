@@ -1,4 +1,4 @@
--module(ertorrent_peer_dispatcher).
+-module(ertorrent_peer_statem).
 -behaviour(gen_statem).
 
 -export([
@@ -25,6 +25,7 @@
 -record(data, {
                queue::list()
               }).
+
 -type data()::#data{}.
 -type event_content()::choke | unchoke | stop | {feed, Queue::list()}.
 -type idle_result()::{keep_state, Data::data()} |

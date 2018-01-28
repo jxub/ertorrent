@@ -3,7 +3,7 @@
 -behaviour(supervisor).
 
 -export([
-         start_child/8
+         start_child/9
         ]).
 
 -export([
@@ -14,11 +14,11 @@
 -define(SETTINGS, ertorrent_settings_srv).
 
 start_child(ID, Block_length, Mode, Info_hash, Peer_id, Piece_length, Socket,
-            Torrent_pid) ->
+            Torrent_pid, Peer_statem_pid) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
     supervisor:start_child(?MODULE, [ID, Block_length, Mode, Info_hash,
                                      Peer_id, Piece_length, Socket,
-                                     Torrent_pid]).
+                                     Torrent_pid, Peer_statem_pid]).
 
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).

@@ -31,6 +31,7 @@
 
 -define(SETTINGS_SRV, ertorrent_settings_srv).
 -define(PEER_SUP, ertorrent_peer_sup).
+-define(PEER_STATEM_SUP, ertorrent_peer_statem_sup).
 -define(PEER_W, ertorrent_peer_worker).
 -define(TORRENT_SRV, ertorrent_torrent_srv).
 -define(TORRENT_W, ertorrent_torrent_worker).
@@ -81,11 +82,24 @@ stop() ->
 start_rx_peer(From, Block_length, Info_hash, Peer_id, Piece_length, {Address,
                                                                      Port})
   when is_binary(Info_hash) ->
-    ID = erlang:unique_integer(),
-    Ret = ?PEER_SUP:start_child(ID, Block_length, rx, Info_hash, Peer_id,
-                                Piece_length, {Address, Port}, From),
+    Statem_ref = make_ref(),
+    Statem_ret = ?PEER_STATEM_SUP:start_child(Statem_ref),
 
-    case Ret of
+    case Statem_ret of
+        {ok, Statem_pid} ->
+            Statem_res = Statem_pid;
+        {error, Reason_statem} ->
+            lager:error("~p:~p: failed to spawn peer_statem: '~p'",
+                        [?MODULE, ?FUNCTION_NAME, Reason_statem}]),
+            Statem_res = error
+    end,
+
+    Worker_ref = make_ref(),
+
+    case Statem_res =/ error andalso
+         ?PEER_SUP:start_child(Worker_ref, Block_length, rx, Info_hash,
+                               Peer_id, Piece_length, {Address, Port},
+                               Torrent_pid, Statem_res) of
         % TODO Atm the handling of the {ok, _} responses is redundant.
         % It's unlikely that both will be used however in the writing
         % moment this cannot be determined and therefore both are taken
@@ -97,12 +111,12 @@ start_rx_peer(From, Block_length, Info_hash, Peer_id, Piece_length, {Address,
                                                                Port]),
             ok = ?PEER_W:connect(Peer_pid),
 
-            {ID, {Address, Port}, Info_hash};
+            {ID, {Address, Port}, Info_hash, Statem_res};
         {ok, Peer_pid, Info} ->
             lager:warning("recv unhandled data Info: '~p'", [Info]),
             ok = ?PEER_W:activate(Peer_pid),
 
-            {ID, {Address, Port}, Info_hash};
+            {ID, {Address, Port}, Info_hash, Statem_res};
         % This is rather unexpected so log it until it is clear when it happens
         {error, Reason_sup} ->
             lager:error("peer_srv failed to spawn a peer_worker (rx), check the peer_sup. reason: '~p'",

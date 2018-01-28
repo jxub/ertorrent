@@ -92,11 +92,11 @@
                 locations::list(),
                 metainfo,
                 peers::list(), % Not contacted peers from the last tracker announcement
-                peer_id::string(), % Our unique peer id e.g. ER-1-0-0-<sha1>
+                peer_id::string(), % Unique peer id e.g. ER1-0-0-<random characters>
                 peer_listen_port::integer(),
                 peers_max::integer(), % The maximum amount of peers this torrent is allowed to have
                 peers_cur::integer(), % Current number of active peers
-                pieces::list(), % A list of piece index
+                pieces::list(), % A list with tuples containing piece related information e.g. {Piece_idx, Piece_hash, File_path, File_offset, Piece_length}
                 piece_length::integer(), % Length of a piece (in bytes). This is retreived from the metainfo.
                 remaining_pieces::list(), % Prioritized list of the remaining pieces
                 state:: initializing | active | inactive,
@@ -304,7 +304,6 @@ init([Metainfo, Start_when_ready]) ->
     %                         end, 0, File_paths),
 
     % Calculate the piece layout over the file structure
-    % TODO rename create_file_mapping
     {ok, Piece_layout} = ?UTILS:create_file_mapping(Resolved_files, Piece_length),
 
     % Create a list with all the piece related information
@@ -415,15 +414,20 @@ handle_cast({torrent_w_request_rx_pieces, From, Peer_bitfield, Piece_number}, St
                 [?MODULE, ?FUNCTION_NAME, From]),
 
     % TODO The distribution limit should not be controlled within this function
-    {ok, Pieces, New_distrib_pieces} = ?ALGO:rx_next(Peer_bitfield,
-                                                     State#state.remaining_pieces,
-                                                     State#state.distributed_rx_pieces,
-                                                     1,
-                                                     Piece_number),
+    {ok, Piece_indices, New_distrib_pieces} = ?ALGO:rx_next(Peer_bitfield,
+                                                            State#state.remaining_pieces,
+                                                            State#state.distributed_rx_pieces,
+                                                            1,
+                                                            Piece_number),
 
     lager:debug("~p: ~p: assigning pieces to peer '~p'", [?MODULE,
                                                           ?FUNCTION_NAME,
-                                                          Pieces]),
+                                                          Piece_indices]),
+
+    Filter = fun({Piece_idx, Piece_hash, File_path, File_offset, Piece_length}) ->
+                 lists:member(Piece_idx, Piece_indices)
+             end,
+    Pieces = lists:filter(State#state.pieces),
 
     From ! {torrent_w_rx_pieces, Pieces},
 
@@ -576,16 +580,6 @@ handle_info({peer_w_rx_bitfield, ID, Bitfield}, State) ->
 handle_info({peer_w_tx_bitfield_req, ID}, State) ->
     ID ! {torrent_w_tx_bitfield_res, State#state.bitfield},
 
-    {noreply, State};
-
-% @doc A peer worker needs to fill up its work queue. Calculate the next piece
-% to request from the peer.
-% @end
-% TODO implement me
-handle_info({peer_w_rx_piece_req, _ID, _Piece_idx, _Piece_data}, State) ->
-    % TODO
-    % - figure out if this only happens when a peer worker finished a piece
-    % - check that we haven't written the same piece already
     {noreply, State};
 
 % @doc A peer has requested a non-cached piece and it have to be read from

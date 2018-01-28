@@ -18,7 +18,7 @@
         ]).
 
 -export([
-         start_link/8,
+         start_link/9,
          stop/1
         ]).
 
@@ -91,6 +91,7 @@
                 sent_handshake::boolean(),
                 state_incoming,
                 state_outgoing,
+                statem_pid::reference(),
                 torrent_bitfield,
                 torrent_info_hash,
                 torrent_info_hash_bin,
@@ -125,10 +126,11 @@ connect(ID) ->
 
 %%% Standard client API
 start_link(ID, Block_length, Mode, Info_hash, Peer_id, Piece_length, Socket,
-           Torrent_pid) ->
+           Torrent_pid, Peer_statem_pid) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
     gen_server:start_link(?MODULE, [ID, Block_length, Mode, Info_hash, Peer_id,
-                                    Piece_length, Socket, Torrent_pid],
+                                    Piece_length, Socket, Torrent_pid,
+                                    Peer_statem_pid],
                           [{hibernate_after, 2000}]).
 
 stop(ID) ->
@@ -145,17 +147,6 @@ reset_tx_keep_alive(Keep_alive_tx_ref) ->
     erlang:cancel(Keep_alive_tx_ref),
 
     erlang:send_after(?KEEP_ALIVE_TX_TIMER, self(), {keep_alive_tx_timeout}).
-
-send_keep_alive(Socket) ->
-    TimerRef = erlang:send_after(?KEEP_ALIVE_TX_TIMER, self(), {keep_alive_internal_timeout}),
-
-    case gen_tcp:send(Socket, <<0:32>>) of
-        ok ->
-            {ok, TimerRef};
-        {error, Reason} ->
-            erlang:cancel(TimerRef),
-            {error, Reason}
-    end.
 
 blocks_to_piece(Blocks) ->
     Sorted_blocks = lists:keysort(1, Blocks),
@@ -195,6 +186,39 @@ complete_piece(State) ->
                             incoming_piece_hash = New_piece_hash},
 
     {ok, New_state}.
+
+parse_peer_flags(Flags_bin) ->
+    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
+
+    Flags_list = binary_to_list(Flags_bin),
+
+    % nth is index 1-based
+    Byte_seven = lists:nth(8, Flags_list),
+    Fast_extension = 16#04,
+    Got_fast_extension = Byte_seven band Fast_extension == Fast_extension,
+    lager:debug("FAST_EXTENSION: '~p'", [Got_fast_extension]),
+
+    Flags = [{fast_extension, Got_fast_extension}],
+    {ok, Flags}.
+
+prepare_request_selection(Rx_queue, Selection_size) ->
+    % Ask for a subset of the blocks
+    % TODO add setting to control the amount of requests in the pipeline
+    Requests = lists:sublist(Rx_queue, Selection_size),
+
+    Fun = fun(Socket, {Piece_index, Begin, Length}) ->
+              {ok, Message} = ?PEER_PROTOCOL:msg_request(Piece_index, Begin, Length),
+
+              {Socket, Message}
+          end,
+
+    % Requests = [{Piece_index, Block_offset, Block_length}, ...]
+    Selection = [{X,Y,Z} || X <- [Fun], Y <- Requests, Z <- [0]],
+
+    {ok, Selection}.
+
+rx_mode() ->
+    Self_interested_req = send_interested(State#state.socket),
 
 handle_bitfield(Bitfield, State) ->
     {ok, Bf_list} = ?BINARY:bitfield_to_list(Bitfield),
@@ -308,6 +332,9 @@ handle_unchoke(State) ->
 handle_interested(State) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 
+    % If someone is interested in downloading, unchoke to signal that we are ready.
+    Self_choked_req = send_unchoke(State#state.socket),
+
     % Updating the peer state
     New_state = State#state{peer_interested = true},
 
@@ -351,86 +378,50 @@ handle_port(Port, State) ->
     New_state = State#state{dht_port = Port},
     {ok, New_state}.
 
-parse_peer_flags(Flags_bin) ->
-    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
+send_message(Socket, {Type, Message}) ->
+    case gen_tcp:send(Socket, Message) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            lager:warning("~p: ~p: failed to send '~p' '~p', reason '~p'",
+                          [?MODULE, ?FUNCTION_NAME, Type, Message, Reason]),
+            error
+    end.
 
-    Flags_list = binary_to_list(Flags_bin),
+send_keep_alive(Socket) ->
+    TimerRef = erlang:send_after(?KEEP_ALIVE_TX_TIMER, self(), {keep_alive_internal_timeout}),
 
-    % nth is index 1-based
-    Byte_seven = lists:nth(8, Flags_list),
-    Fast_extension = 16#04,
-    Got_fast_extension = Byte_seven band Fast_extension == Fast_extension,
-    lager:debug("FAST_EXTENSION: '~p'", [Got_fast_extension]),
-
-    Flags = [{fast_extension, Got_fast_extension}],
-    {ok, Flags}.
-
-prepare_request_selection(Rx_queue, Selection_size) ->
-    % Ask for a subset of the blocks
-    % TODO add setting to control the amount of requests in the pipeline
-    Requests = lists:sublist(Rx_queue, Selection_size),
-
-    Fun = fun(Socket, Request, State) ->
-              send_request(Socket, Request, State)
-          end,
-
-    % Requests = [{Piece_index, Block_offset, Block_length}, ...]
-    Selection = [{X,Y,Z} || X <- [Fun], Y <- Requests, Z <- [0]],
-
-    {ok, Selection}.
+    case gen_tcp:send(Socket, <<0:32>>) of
+        ok ->
+            {ok, TimerRef};
+        {error, Reason} ->
+            erlang:cancel(TimerRef),
+            {error, Reason}
+    end.
 
 send_bitfield(Socket, Bitfield) ->
     Bitfield_len = bit_size(Bitfield),
 
     {ok, Bitfield_msg} = ?PEER_PROTOCOL:msg_bitfield(Bitfield_len, Bitfield),
 
-    gen_tcp:send(Socket, Bitfield_msg).
+    send_message(Socket, {bitfield, Bitfield_msg}).
 
 send_handshake(Socket, Peer_id_str, Torrent_info_bin) ->
+    % TODO Check if this is correct after peer_id change
     Peer_id_bin = list_to_binary(Peer_id_str),
-    {ok, Handshake} = ?PEER_PROTOCOL:msg_handshake(Torrent_info_bin,
+    {ok, Handshake_msg} = ?PEER_PROTOCOL:msg_handshake(Torrent_info_bin,
                                                    Peer_id_bin),
-    gen_tcp:send(Socket, Handshake).
-
-dispatch(Socket, Message) ->
-    case gen_tcp:send(Socket, Message) of
-        ok ->
-            ok;
-        {error, Reason} ->
-            lager:debug("~p: ~p: reason '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
-            error
-    end.
+    send_message(Socket, {handshake, Handshake_msg}).
 
 send_interested(Socket) ->
     {ok, Interested_msg} = ?PEER_PROTOCOL:msg_interested(),
 
-    case gen_tcp:send(Socket, Interested_msg) of
-        ok ->
-            lager:debug("~p: ~p: sent interested", [?MODULE, ?FUNCTION_NAME]),
-            ok;
-        {error, Reason} ->
-            lager:warning("~p: ~p: failed to send interested, reason: '~p'",
-                          [?MODULE, ?FUNCTION_NAME, Reason]),
-            error
-    end.
+    send_message(Socket, {interested, Interested_msg}).
 
 send_unchoke(Socket) ->
     {ok, Unchoke_msg} = ?PEER_PROTOCOL:msg_unchoke(),
 
-    case gen_tcp:send(Socket, Unchoke_msg) of
-        ok ->
-            lager:debug("~p: ~p: sent unchoke", [?MODULE, ?FUNCTION_NAME]),
-            ok;
-        {error, Reason} ->
-            lager:warning("~p: ~p: failed to send unchoke, reason: '~p'",
-                          [?MODULE, ?FUNCTION_NAME, Reason]),
-            error
-    end.
-
-send_request(Socket, {Piece_index, Begin, Length}, State) ->
-    {ok, Message} = ?PEER_PROTOCOL:msg_request(Piece_index, Begin, Length),
-
-    send_message(Socket, Message, State).
+    send_message(Socket, {unchoke, Unchoke_msg}).
 
 send_requests(State) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
@@ -458,7 +449,8 @@ send_requests(State) ->
 
     New_dispatched = lists:concat(Rx_data#rx_data.dispatched,
                                   Rx_data#rx_data.prepared),
-    New_rx_data = Rx_data#rx_data{prepared = []}
+    New_rx_data = Rx_data#rx_data{dispatched = New_dispatched,
+                                  prepared = []},
 
     % If _any_ of the retries result in an error, terminate the peer
     case lists:member(error, New_retries) of
@@ -466,12 +458,13 @@ send_requests(State) ->
             {noreply, New_state, hibernate};
         true ->
             {stop, normal, State}
-    end;
+    end.
 
 
 %%% Callback module
-init([ID, Block_length, Mode, Info_hash, Peer_id, Piece_length, {Address, Port}, Torrent_pid])
-      when is_integer(ID)
+init([ID, Block_length, Mode, Info_hash, Peer_id, Piece_length,
+      {Address, Port}, Torrent_pid, Peer_statem_pid])
+      when is_reference(ID)
       andalso is_binary(Info_hash) ->
     lager:debug("~p: ~p: starting peer with \
                 ID: '~p' \
@@ -493,7 +486,7 @@ init([ID, Block_length, Mode, Info_hash, Peer_id, Piece_length, {Address, Port},
                        dispatched = [],
                        prepared = [],
                        received = []
-                      }
+                      },
 
     {ok, #state{
                 address = Address,
@@ -513,6 +506,7 @@ init([ID, Block_length, Mode, Info_hash, Peer_id, Piece_length, {Address, Port},
                 self_choked = true,
                 self_interested = false,
                 sent_handshake = false,
+                statem_pid = Peer_statem_pid,
                 torrent_info_hash_bin = Info_hash,
                 torrent_pid = Torrent_pid},
                 hibernate
@@ -735,23 +729,34 @@ handle_info({peer_srv_tx_piece, Index, Hash, Data}, State) ->
 
     {noreply, New_state, hibernate};
 
+prepare_rx_blocks(Pieces, Block_length) when is_list(Pieces) andalso
+                                             is_integer(Block_length) ->
+    Foldl = fun({Piece_idx, Piece_hash, File_path, File_offset,
+                 Piece_length}) ->
+                % Generate a tuple list with the block offsets and the length per block
+                {ok, Block_offsets} = ?UTILS:block_offsets(State#state.block_length,
+                                                           State#state.piece_length),
+
+                % The block offsets is the same for each piece so lets put them together in
+                % a tuplelist.
+                Add_rx_queue = [{Piece_index, Block_offset, Block_length} ||
+                                Piece_index <- Pieces,
+                                {Block_offset, Block_length} <- Block_offsets],
+            end,
+
+% @doc Response from the torrent worker with a set of pieces that needs to be
+% requested.
+% Pieces: List tuples [{Piece_idx, Piece_hash, File_path, File_offset, Piece_length}]
+% @end
 handle_info({torrent_w_rx_pieces, Pieces}, State) ->
     lager:debug("~p: ~p: torrent_w_rx_pieces: '~p'", [?MODULE, ?FUNCTION_NAME, Pieces]),
 
-    Self_interested_req = send_interested(State#state.socket),
-    Self_choked_req = send_unchoke(State#state.socket),
-
-    case Self_interested_req == ok andalso Self_choked_req == ok of
+    case State#state.self_interested == true of
         true ->
-            % Generate a tuple list with the block offsets and the length per block
-            {ok, Block_offsets} = ?UTILS:block_offsets(State#state.block_length,
-                                                       State#state.piece_length),
-
-            % The block offsets is the same for each piece so lets put them together in
-            % a tuplelist.
-            Add_rx_queue = [{Piece_index, Block_offset, Block_length} ||
-                            Piece_index <- Pieces,
-                            {Block_offset, Block_length} <- Block_offsets],
+            % CONTINUE HERE
+            % TODO Pieces is a list of pieces, so iterate through and generate
+            % block_offsets for each piece
+            
 
             Old_retry = State#state.retry,
             Old_retry_queue = Old_retry#retry.queue,
@@ -765,7 +770,7 @@ handle_info({torrent_w_rx_pieces, Pieces}, State) ->
             New_rx_queue = State#state.rx_queue ++ Add_rx_queue,
 
             Rx_data = State#state.rx_data,
-            Prepared = lists:merge(Rx_data.prepared, Selection),
+            Prepared = lists:merge(Rx_data#data.prepared, Selection),
             New_rx_data = Rx_data#rx_data{prepared = Prepared},
 
             New_state = State#state{assigned_pieces = Pieces,
@@ -865,6 +870,8 @@ handle_info({tcp, _S, <<19/integer,
                           [?MODULE, ?FUNCTION_NAME, State#state.id]),
             {stop, normal, State}
     end;
+% @doc Parse messages with an ID
+% @end
 handle_info({tcp, _S, <<Length:32/big-integer,
                         Message_id:8/big-integer,
                         Rest/binary>>}, State) ->
