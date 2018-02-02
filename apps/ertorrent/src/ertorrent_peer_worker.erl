@@ -41,12 +41,6 @@
                   received::list()
                  }).
 
--record(retry, {
-                max_attempts::integer(),
-                queue::list(),
-                timer::integer()
-               }).
-
 -record(state, {
                 address,
                 assigned_pieces::list(),
@@ -729,20 +723,22 @@ handle_info({peer_srv_tx_piece, Index, Hash, Data}, State) ->
 
     {noreply, New_state, hibernate};
 
-prepare_rx_blocks(Pieces, Block_length) when is_list(Pieces) andalso
-                                             is_integer(Block_length) ->
+prepare_rx_blocks(Pieces, Max_block_length) when is_list(Pieces) andalso
+                                             is_integer(Max_block_length) ->
     Foldl = fun({Piece_idx, Piece_hash, File_path, File_offset,
                  Piece_length}) ->
                 % Generate a tuple list with the block offsets and the length per block
-                {ok, Block_offsets} = ?UTILS:block_offsets(State#state.block_length,
-                                                           State#state.piece_length),
+                {ok, Block_offsets} = ?UTILS:block_offsets(Max_block_length,
+                                                           Piece_length),
 
                 % The block offsets is the same for each piece so lets put them together in
                 % a tuplelist.
-                Add_rx_queue = [{Piece_index, Block_offset, Block_length} ||
-                                Piece_index <- Pieces,
-                                {Block_offset, Block_length} <- Block_offsets],
+                [{Piece_index, Block_offset, Block_length} ||
+                 Piece_index <- Pieces,
+                 {Block_offset, Block_length} <- Block_offsets]
             end,
+    Rx_blocks = lists:foldl(Foldl, Pieces),
+    {ok, Rx_blocks}.
 
 % @doc Response from the torrent worker with a set of pieces that needs to be
 % requested.
@@ -753,25 +749,18 @@ handle_info({torrent_w_rx_pieces, Pieces}, State) ->
 
     case State#state.self_interested == true of
         true ->
-            % CONTINUE HERE
-            % TODO Pieces is a list of pieces, so iterate through and generate
-            % block_offsets for each piece
-            
-
-            Old_retry = State#state.retry,
-            Old_retry_queue = Old_retry#retry.queue,
+            % Rx_blocks = [Rx_queue0, Rx_queue1]
+            {ok, Rx_blocks} = prepare_rx_blocks(Pieces, State#state.block_length),
 
             {ok, Selection} = prepare_request_selection(Add_rx_queue, 10),
 
             New_retry_queue = lists:merge(Selection, Old_retry_queue),
 
-            Retry = Old_retry#retry{queue = New_retry_queue},
-
-            New_rx_queue = State#state.rx_queue ++ Add_rx_queue,
-
             Rx_data = State#state.rx_data,
             Prepared = lists:merge(Rx_data#data.prepared, Selection),
             New_rx_data = Rx_data#rx_data{prepared = Prepared},
+
+            %CONTINUE HERE - send blocks to statem
 
             New_state = State#state{assigned_pieces = Pieces,
                                     retry = Retry,
