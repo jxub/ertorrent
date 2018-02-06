@@ -74,8 +74,6 @@
                 piece_length::integer(),
                 port::integer(),
                 received_handshake::boolean(),
-                retry::#retry{},
-                retry_ref,
                 request_buffer::list(),
                 rx_queue::list(),
                 rx_data::#rx_data{},
@@ -83,8 +81,6 @@
                 self_choked::boolean(),
                 self_interested::boolean(),
                 sent_handshake::boolean(),
-                state_incoming,
-                state_outgoing,
                 statem_pid::reference(),
                 torrent_bitfield,
                 torrent_info_hash,
@@ -108,6 +104,7 @@
 
 -define(BINARY, ertorrent_binary_utils).
 -define(PEER_SRV, ertorrent_peer_srv).
+-define(PEER_STATEM, ertorrent_peer_statem).
 -define(PEER_PROTOCOL, ertorrent_peer_tcp_protocol).
 -define(TORRENT_W, ertorrent_torrent_worker).
 -define(UTILS, ertorrent_utils).
@@ -211,8 +208,43 @@ prepare_request_selection(Rx_queue, Selection_size) ->
 
     {ok, Selection}.
 
-rx_mode() ->
-    Self_interested_req = send_interested(State#state.socket),
+rx_mode(Socket) ->
+    send_interested(Socket).
+
+tx_mode(Socket) ->
+    send_unchoke(Socket).
+
+mode_init(rx, Socket) ->
+    rx_mode(Socket);
+mode_init(tx, Socket) ->
+    tx_mode(Socket).
+
+connected_init(State) ->
+    case send_handshake(State#state.socket,
+                        State#state.peer_id,
+                        State#state.torrent_info_hash_bin) of
+        ok ->
+            lager:debug("~p: ~p: sent handshake", [?MODULE, ?FUNCTION_NAME]),
+            % This is automatically canceled if the process terminates
+            Keep_alive_tx_ref = erlang:send_after(?KEEP_ALIVE_TX_TIMER,
+                                                  self(),
+                                                  {keep_alive_tx_timeout}),
+
+            Keep_alive_rx_ref = erlang:send_after(?KEEP_ALIVE_RX_TIMER,
+                                                  self(),
+                                                  {keep_alive_rx_timeout}),
+
+            mode_init(State#state.mode, State#state.socket),
+
+            {noreply,
+             State#state{keep_alive_rx_ref = Keep_alive_rx_ref,
+                         keep_alive_tx_ref = Keep_alive_tx_ref,
+                         sent_handshake = true},
+             hibernate};
+        {error, Reason} ->
+            lager:debug("~p: ~p: failed send handshake, reason: '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
+            {stop, normal, State}
+    end.
 
 handle_bitfield(Bitfield, State) ->
     {ok, Bf_list} = ?BINARY:bitfield_to_list(Bitfield),
@@ -327,7 +359,7 @@ handle_interested(State) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 
     % If someone is interested in downloading, unchoke to signal that we are ready.
-    Self_choked_req = send_unchoke(State#state.socket),
+    ok = send_unchoke(State#state.socket),
 
     % Updating the peer state
     New_state = State#state{peer_interested = true},
@@ -417,45 +449,29 @@ send_unchoke(Socket) ->
 
     send_message(Socket, {unchoke, Unchoke_msg}).
 
-send_requests(State) ->
-    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
+% -spec pieces_to_blocks_offsets(Pieces::list(), Max_block_length::integer()) -> {ok, list()}.
+% @doc Create a tuple list with block information form a list of pieces. Output
+% example [{Piece_index, Block_offset, Block_length}]
+% @end
+pieces_to_block_offsets(Pieces, Max_block_length) when is_list(Pieces) andalso
+                                                 is_integer(Max_block_length) ->
+    Foldl = fun({Piece_idx, _Piece_hash, _File_path, _File_offset,
+                 Piece_length}) ->
+                % Generate a tuple list with the block offsets and the length per block
+                {ok, Block_offsets} = ?UTILS:block_offsets(Max_block_length,
+                                                           Piece_length),
 
-    Rx_data = State#state.rx_data,
-
-
-    Foldl = fun(Entry, Acc) ->
-                {Fun, Message, Attempts} = Entry,
-                {Socket, Retry_list} = Acc,
-
-                case Fun(Socket, Message, State) of
-                    % Successfully sent the piece request
-                    ok ->
-                        New_retry_list = Retry_list;
-                    error ->
-                        lager:debug("~p: ~p: failed to send message to peer, terminating peer",
-                                    [?MODULE, ?FUNCTION_NAME]),
-                        New_retry_list = [error| Retry_list]
-                end,
-
-                {Socket, New_retry_list}
+                % The block offsets is the same for each piece so lets put them together in
+                % a tuplelist.
+                [{Piece_index, Block_offset, Block_length} ||
+                 Piece_index <- [Piece_idx],
+                 {Block_offset, Block_length} <- Block_offsets]
             end,
-    {_Socket, New_retries} = lists:foldl(Foldl, {State#state.socket, []}, Rx_data#rx_data.prepared),
+    Rx_blocks = lists:foldl(Foldl, Pieces),
+    {ok, Rx_blocks}.
 
-    New_dispatched = lists:concat(Rx_data#rx_data.dispatched,
-                                  Rx_data#rx_data.prepared),
-    New_rx_data = Rx_data#rx_data{dispatched = New_dispatched,
-                                  prepared = []},
+%%% gen_server callback functions
 
-    % If _any_ of the retries result in an error, terminate the peer
-    case lists:member(error, New_retries) of
-        false ->
-            {noreply, New_state, hibernate};
-        true ->
-            {stop, normal, State}
-    end.
-
-
-%%% Callback module
 init([ID, Block_length, Mode, Info_hash, Peer_id, Piece_length,
       {Address, Port}, Torrent_pid, Peer_statem_pid])
       when is_reference(ID)
@@ -468,13 +484,6 @@ init([ID, Block_length, Mode, Info_hash, Peer_id, Piece_length,
                 peer id: '~p' \
                 piece length: '~p'",
                 [?MODULE, ?FUNCTION_NAME, ID, Block_length, Mode, Info_hash, Peer_id, Piece_length]),
-
-    % Assigning default values for retries
-    Retry = #retry{
-                   max_attempts = 300,
-                   queue = [],
-                   timer = 100
-                  },
 
     Rx_data = #rx_data{
                        dispatched = [],
@@ -494,7 +503,6 @@ init([ID, Block_length, Mode, Info_hash, Peer_id, Piece_length,
                 piece_length = Piece_length,
                 port = Port,
                 received_handshake = false,
-                retry = Retry,
                 rx_data = Rx_data,
                 rx_queue = [],
                 self_choked = true,
@@ -548,35 +556,11 @@ handle_cast(peer_w_connect, State) ->
     case gen_tcp:connect(State#state.address,
                          State#state.port, [binary, {packet, 0}], 2000) of
         {ok, Socket} ->
-            lager:debug("~p: ~p: connected to peer '~p:~p'", [?MODULE,
-                                                              ?FUNCTION_NAME,
-                                                              State#state.address,
-                                                              State#state.port
-                                                             ]),
-            case send_handshake(Socket,
-                                State#state.peer_id,
-                                State#state.torrent_info_hash_bin) of
-                ok ->
-                    lager:debug("~p: ~p: sent handshake", [?MODULE, ?FUNCTION_NAME]),
-                    % This is automatically canceled if the process terminates
-                    Keep_alive_tx_ref = erlang:send_after(?KEEP_ALIVE_TX_TIMER,
-                                                          self(),
-                                                          {keep_alive_tx_timeout}),
-
-                    Keep_alive_rx_ref = erlang:send_after(?KEEP_ALIVE_RX_TIMER,
-                                                          self(),
-                                                          {keep_alive_rx_timeout}),
-
-                    {noreply,
-                     State#state{keep_alive_rx_ref = Keep_alive_rx_ref,
-                                 keep_alive_tx_ref = Keep_alive_tx_ref,
-                                 sent_handshake = true,
-                                 socket = Socket},
-                     hibernate};
-                {error, Reason} ->
-                    lager:debug("~p: ~p: failed send handshake, reason: '~p'", [?MODULE, ?FUNCTION_NAME, Reason]),
-                    {stop, normal, State}
-            end;
+            lager:debug("~p: ~p: connected to peer '~p:~p'",
+                        [?MODULE, ?FUNCTION_NAME, State#state.address,
+                         State#state.port ]),
+            State_sock = State#state{socket = Socket},
+            connected_init(State_sock);
         {error, Reason_connect} ->
             lager:debug("~p: ~p: peer_srv failed to establish connection with peer address: '~p', port: '~p', reason: '~p'",
                         [?MODULE,
@@ -608,63 +592,6 @@ handle_info({keep_alive_tx_timeout}, State) ->
             lager:debug("~p: ~p: failed to send timeout: '~p'", [?MODULE,
                                                                  ?FUNCTION_NAME,
                                                                  Reason]),
-            {stop, normal, State}
-    end;
-
-% TODO when this is used make sure to cancel the retry reference
-handle_info({message_retry_loop}, State) ->
-    lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
-
-    Old_retry = State#state.retry,
-    Max_attempts = Old_retry#retry.max_attempts,
-
-    Foldl = fun(Entry, Acc) ->
-                {Fun, Message, Attempts} = Entry,
-                {Socket, Retry_list} = Acc,
-
-                case Fun(Socket, Message, State) of
-                    % Successfully sent the piece request
-                    ok ->
-                        New_retry_list = Retry_list;
-                    % Keep on retrying
-                    not_ready when Attempts =< Max_attempts ->
-                        New_retry_list = [{Fun, Message, Attempts + 1}| Retry_list];
-                    % Exceeded the maximum amount of attempts for the request propagate
-                    % error.
-                    not_ready when Attempts > Max_attempts ->
-                        lager:debug("~p: ~p: reached maximum amount of retries for message '~p', terminating peer",
-                                    [?MODULE, ?FUNCTION_NAME, Message]),
-                        New_retry_list = [error| Retry_list];
-                    % Failed to transmit, propagate error
-                    error ->
-                        lager:debug("~p: ~p: failed to send message to peer, terminating peer",
-                                    [?MODULE, ?FUNCTION_NAME]),
-                        New_retry_list = [error| Retry_list]
-                end,
-
-                {Socket, New_retry_list}
-            end,
-    {_Socket, New_retries} = lists:foldl(Foldl, {State#state.socket, []}, Old_retry#retry.queue),
-
-    New_retry = Old_retry#retry{queue = New_retries},
-
-    % If _any_ of the retries result in an error, terminate the peer
-    case lists:member(error, New_retries) of
-        false ->
-            % Check if theres any queued requests left, otherwise don't refresh the
-            % timer.
-            case length(New_retries) == 0 of
-                true ->
-                    New_state = State#state{retry = New_retry,
-                                            retry_ref = undefined};
-                false ->
-                    Ref = erlang:send_after(?RETRY_TIMER, self(), {message_retry_loop}),
-                    New_state = State#state{retry = New_retry,
-                                            retry_ref = Ref}
-            end,
-
-            {noreply, New_state, hibernate};
-        true ->
             {stop, normal, State}
     end;
 
@@ -723,23 +650,6 @@ handle_info({peer_srv_tx_piece, Index, Hash, Data}, State) ->
 
     {noreply, New_state, hibernate};
 
-prepare_rx_blocks(Pieces, Max_block_length) when is_list(Pieces) andalso
-                                             is_integer(Max_block_length) ->
-    Foldl = fun({Piece_idx, Piece_hash, File_path, File_offset,
-                 Piece_length}) ->
-                % Generate a tuple list with the block offsets and the length per block
-                {ok, Block_offsets} = ?UTILS:block_offsets(Max_block_length,
-                                                           Piece_length),
-
-                % The block offsets is the same for each piece so lets put them together in
-                % a tuplelist.
-                [{Piece_index, Block_offset, Block_length} ||
-                 Piece_index <- Pieces,
-                 {Block_offset, Block_length} <- Block_offsets]
-            end,
-    Rx_blocks = lists:foldl(Foldl, Pieces),
-    {ok, Rx_blocks}.
-
 % @doc Response from the torrent worker with a set of pieces that needs to be
 % requested.
 % Pieces: List tuples [{Piece_idx, Piece_hash, File_path, File_offset, Piece_length}]
@@ -749,23 +659,27 @@ handle_info({torrent_w_rx_pieces, Pieces}, State) ->
 
     case State#state.self_interested == true of
         true ->
+            % Rx_queue = [{Piece_idx, Block_offset, Block_length}]
             % Rx_blocks = [Rx_queue0, Rx_queue1]
-            {ok, Rx_blocks} = prepare_rx_blocks(Pieces, State#state.block_length),
-
-            {ok, Selection} = prepare_request_selection(Add_rx_queue, 10),
-
-            New_retry_queue = lists:merge(Selection, Old_retry_queue),
+            {ok, Rx_blocks} = pieces_to_block_offsets(Pieces, State#state.block_length),
 
             Rx_data = State#state.rx_data,
-            Prepared = lists:merge(Rx_data#data.prepared, Selection),
-            New_rx_data = Rx_data#rx_data{prepared = Prepared},
 
-            %CONTINUE HERE - send blocks to statem
+            Dispatched = case Rx_data#rx_data.dispatched == [] of
+                true ->
+                    {ok, Selection} = prepare_request_selection(Rx_blocks, 10),
+                    ?PEER_STATEM:feed(State#state.statem_pid, Selection),
+                    lists:merge(Selection, Rx_data#rx_data.dispatched);
+                false ->
+                    Rx_data#rx_data.dispatched
+            end,
+
+            Prepared = lists:merge(Rx_data#rx_data.prepared, Rx_blocks),
+            New_rx_data = Rx_data#rx_data{dispatched = Dispatched,
+                                          prepared = Prepared},
 
             New_state = State#state{assigned_pieces = Pieces,
-                                    retry = Retry,
                                     rx_data = New_rx_data,
-                                    rx_queue = New_rx_queue,
                                     self_choked = false,
                                     self_interested = true},
 

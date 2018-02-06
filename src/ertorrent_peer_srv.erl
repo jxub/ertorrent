@@ -79,24 +79,23 @@ stop() ->
     gen_server:cast(?MODULE, stop).
 
 %%% Internal functions
-start_rx_peer(From, Block_length, Info_hash, Peer_id, Piece_length, {Address,
-                                                                     Port})
-  when is_binary(Info_hash) ->
+start_rx_peer(Torrent_pid, Block_length, Info_hash, Peer_id, Piece_length,
+              {Address, Port}) when is_binary(Info_hash) ->
     Statem_ref = make_ref(),
     Statem_ret = ?PEER_STATEM_SUP:start_child(Statem_ref),
 
-    case Statem_ret of
-        {ok, Statem_pid} ->
-            Statem_res = Statem_pid;
+    Statem_res = case Statem_ret of
+        {ok, _Statem_pid} ->
+            Statem_ref;
         {error, Reason_statem} ->
             lager:error("~p:~p: failed to spawn peer_statem: '~p'",
-                        [?MODULE, ?FUNCTION_NAME, Reason_statem}]),
-            Statem_res = error
+                        [?MODULE, ?FUNCTION_NAME, Reason_statem]),
+            error
     end,
 
     Worker_ref = make_ref(),
 
-    case Statem_res =/ error andalso
+    case Statem_res /= error andalso
          ?PEER_SUP:start_child(Worker_ref, Block_length, rx, Info_hash,
                                Peer_id, Piece_length, {Address, Port},
                                Torrent_pid, Statem_res) of
@@ -111,12 +110,7 @@ start_rx_peer(From, Block_length, Info_hash, Peer_id, Piece_length, {Address,
                                                                Port]),
             ok = ?PEER_W:connect(Peer_pid),
 
-            {ID, {Address, Port}, Info_hash, Statem_res};
-        {ok, Peer_pid, Info} ->
-            lager:warning("recv unhandled data Info: '~p'", [Info]),
-            ok = ?PEER_W:activate(Peer_pid),
-
-            {ID, {Address, Port}, Info_hash, Statem_res};
+            {Worker_ref, {Address, Port}, Info_hash, Statem_res};
         % This is rather unexpected so log it until it is clear when it happens
         {error, Reason_sup} ->
             lager:error("peer_srv failed to spawn a peer_worker (rx), check the peer_sup. reason: '~p'",

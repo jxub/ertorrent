@@ -34,6 +34,8 @@
              ertorrent_peer_srv,
              ertorrent_peer_sup,
              ertorrent_peer_worker,
+             ertorrent_peer_statem,
+             ertorrent_peer_statem_sup,
              ertorrent_rest_v1_top,
              ertorrent_settings_srv,
              ertorrent_sup,

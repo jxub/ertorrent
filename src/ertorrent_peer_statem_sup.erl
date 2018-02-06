@@ -3,7 +3,7 @@
 -behaviour(supervisor).
 
 -export([
-         start_child/8
+         start_child/1
         ]).
 
 -export([

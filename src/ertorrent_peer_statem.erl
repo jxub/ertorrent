@@ -55,9 +55,16 @@ stop(ID) ->
 
 dispatch([]) ->
     ok;
-dispatch([H| Rest]) ->
-    io:format("~p: dispatching '~p'~n", [?FUNCTION_NAME, H]),
-    dispatch(Rest).
+dispatch([{Socket, Request}| Rest]) ->
+    io:format("~p: dispatching '~p'~n", [?FUNCTION_NAME, Request]),
+    case gen_tcp:send(Socket, Request) of
+        ok ->
+            dispatch(Rest);
+        {error, Reason} ->
+            lager:warning("~p: ~p: failed to send '~p' '~p', reason '~p'",
+                          [?MODULE, ?FUNCTION_NAME, Request, Reason]),
+            error
+    end.
 
 %%% Behaviour callback functions
 

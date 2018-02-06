@@ -58,8 +58,6 @@ rx_update(Own_bitfield, Peer_bitfields) when
     % Sorting the summary
     Rarest_first = lists:keysort(2, Sum_with_idx),
 
-    lager:debug("ERROR?! Rarest: '~p', Own bf '~p'", [length(Rarest_first), length(Own_bitfield)]),
-
     % Zip with the own bitfield
     Zipped = lists:zipwith(fun({Index, Occurrences}, Bit) ->
                                {Index, Occurrences, Bit}
@@ -77,14 +75,16 @@ rx_update(Own_bitfield, Peer_bitfields) when
 
     {ok, Filtered}.
 
--spec rx_next() -> ok.
-% TODO Add Last_index so we can pack that piece in a tuple e.g. {Index, last} so that the peer can calculate the block offsets for the last piece since it most likely will be smaller than a regular piece.
+-spec rx_next(Peer_bitfield::list(),
+              Prioritized_pieces::list(),
+              Distributed_pieces::list(),
+              Piece_distribution_limit::integer(),
+              Piece_queue_limit::integer()) -> list().
 rx_next(Peer_bitfield,
         Prioritized_pieces,
         Distributed_pieces,
         Piece_distribution_limit,
-        Piece_queue_limit,
-        Last_index) when
+        Piece_queue_limit) when
       is_list(Prioritized_pieces) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
 
@@ -98,6 +98,8 @@ rx_next(Peer_bitfield,
                                          not lists:member(Piece_index, Limited_pieces)
                                      end, Prioritized_pieces),
 
+    % If the peer chose to not announce its bitfield, fallback to a stupid
+    % selection of trail and error.
     case Peer_bitfield == undefined of
         true ->
             Available_pieces = WO_limited_pieces;

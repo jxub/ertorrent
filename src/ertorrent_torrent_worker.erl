@@ -424,10 +424,10 @@ handle_cast({torrent_w_request_rx_pieces, From, Peer_bitfield, Piece_number}, St
                                                           ?FUNCTION_NAME,
                                                           Piece_indices]),
 
-    Filter = fun({Piece_idx, Piece_hash, File_path, File_offset, Piece_length}) ->
+    Filter = fun({Piece_idx, _Piece_hash, _File_path, _File_offset, _Piece_length}) ->
                  lists:member(Piece_idx, Piece_indices)
              end,
-    Pieces = lists:filter(State#state.pieces),
+    Pieces = lists:filter(Filter, State#state.pieces),
 
     From ! {torrent_w_rx_pieces, Pieces},
 

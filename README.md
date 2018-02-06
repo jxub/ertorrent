@@ -7,20 +7,15 @@ source torrent client written in erlang.
 
 We use rebar to build the project.
 
-    $ rebar compile
+    $ rebar3 compile
 
-You can run the tests with
+For development, we recommend to build and get an interactive erlang shell with:
 
-    $ rebar eunit
+    $ rebar3 shell --config=config/sys.config
+
+You can run the tests with:
+
+    $ rebar3 eunit
 
 ## Contribute
 
-### Message tagging
-
-Two-way communication:
-<sender (module)>_<s(erver)|w(orker)>_<message name>_<res(ponse)|req(uest)>
-Example: file_w_read_offset_res
-
-One-way communication:
-<sender (module)>_<s(erver)|w(orker)>_<message name>
-Example: peer_w_terminate
