@@ -1,7 +1,6 @@
 -module(ertorrent_sup).
 
--export([start/0,
-         start_link/0,
+-export([start_link/0,
          init/1]).
 
 -include("ertorrent_log.hrl").
@@ -14,9 +13,6 @@
                          {Module, start_link, []},
                          transient, infinity, worker, [Module]}).
 
-start() ->
-    supervisor:start({local, ?MODULE}, ?MODULE, []).
-
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
@@ -28,6 +24,7 @@ init(_Arg) ->
 
     Supervisors = [
                    ertorrent_peer_sup,
+                   ertorrent_peer_statem_sup,
                    ertorrent_torrent_sup,
                    ertorrent_file_sup
                   ],
