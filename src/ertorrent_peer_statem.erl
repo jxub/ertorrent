@@ -26,6 +26,8 @@
                queue::list()
               }).
 
+-define(PEER_W, ertorrent_peer_worker).
+
 -type data()::#data{}.
 -type event_content()::choke | unchoke | stop | {feed, Queue::list()}.
 -type idle_result()::{keep_state, Data::data()} |
@@ -38,18 +40,23 @@
 
 %%% Module API
 
+-spec choke(ID::reference()) -> ok.
 choke(ID) ->
     gen_statem:cast(ID, choke).
 
+-spec unchoke(ID::reference()) -> ok.
 unchoke(ID) ->
     gen_statem:cast(ID, unchoke).
 
+-spec feed(ID::reference(), Queue::list()) -> ok.
 feed(ID, Queue) when is_list(Queue) ->
     gen_statem:cast(ID, {feed, Queue}).
 
+-spec start_link(ID::reference()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(ID) ->
     gen_statem:start_link({local, ID}, ?MODULE, [], []).
 
+-spec stop(ID::reference()) -> ok.
 stop(ID) ->
     gen_statem:cast(ID, stop).
 
@@ -114,6 +121,7 @@ run(cast, unchoke, Data) ->
     case Data#data.queue == [] of
         false ->
             ok = dispatch(Data#data.queue),
+            ?PEER_W:request_blocks(self()),
             {keep_state, #data{queue = []}};
         true ->
             {keep_state, Data}

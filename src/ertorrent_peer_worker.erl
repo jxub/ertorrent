@@ -10,22 +10,24 @@
 
 -behaviour(gen_server).
 
--export([
-         connect/1,
-         reset_rx_keep_alive/1,
-         reset_tx_keep_alive/1,
-         send_keep_alive/1
-        ]).
+%%% client API
 
 -export([
-         start_link/9,
-         stop/1
+         connect/1,
+         request_blocks/1,
+         reset_rx_keep_alive/1, % Internal, used by timer
+         reset_tx_keep_alive/1, % Internal, used by timer
+         send_keep_alive/1 % Internal, used by timer
         ]).
+
+%%% gen_server
 
 -export([init/1,
          handle_call/3,
          handle_cast/2,
          handle_info/2,
+         start_link/9,
+         stop/1,
          terminate/2]).
 
 -include("ertorrent_log.hrl").
@@ -207,6 +209,9 @@ prepare_request_selection(Rx_queue, Selection_size) ->
     Selection = [{X,Y,Z} || X <- [Fun], Y <- Requests, Z <- [0]],
 
     {ok, Selection}.
+
+request_blocks(Statem_ref) ->
+    gen_server:cast(Statem_ref, {peer_w_request_blocks, Statem_ref}).
 
 rx_mode(Socket) ->
     send_interested(Socket).
@@ -571,6 +576,18 @@ handle_cast(peer_w_connect, State) ->
 
             {stop, normal, State}
     end;
+handle_cast({peer_w_request_blocks, Statem_ref}, State) ->
+    Rx = State#state.rx_data,
+
+    Blocks = lists:sublist(Rx#rx_data.prepared),
+    Dispatched = lists:merge(Rx#rx_data.dispatched, Blocks),
+
+    New_rx = Rx#rx_data{dispatched = Dispatched},
+    New_state = State#state{rx_data = New_rx},
+
+    Statem_ref ! {feed, Blocks},
+
+    {noreply, New_state, hibernate};
 handle_cast(stop, State) ->
     {stop, normal, State};
 handle_cast(Request, State) ->
