@@ -227,7 +227,7 @@ init(_Args) ->
 % _Reason is defined as unused to avoid compilation warning when not building
 % as debug.
 terminate(Reason, _State) ->
-    lager:info("shutting down: '~p'", [Reason]),
+    lager:debug("shutting down: '~p'", [Reason]),
     ok.
 
 handle_call(terminate, _From, State) ->

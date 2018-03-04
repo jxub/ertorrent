@@ -5,7 +5,7 @@
          choke/1,
          unchoke/1,
          feed/2,
-         start_link/1,
+         start_link/2,
          stop/1
         ]).
 
@@ -23,7 +23,8 @@
         ]).
 
 -record(data, {
-               queue::list()
+               queue::list(),
+               peer_ref::atom() | terminated
               }).
 
 -define(PEER_W, ertorrent_peer_worker).
@@ -40,35 +41,39 @@
 
 %%% Module API
 
--spec choke(ID::reference()) -> ok.
-choke(ID) ->
-    gen_statem:cast(ID, choke).
+-spec choke(Self_ref::atom()) -> ok.
+choke(Self_ref) ->
+    gen_statem:cast(Self_ref, choke).
 
--spec unchoke(ID::reference()) -> ok.
-unchoke(ID) ->
-    gen_statem:cast(ID, unchoke).
+-spec unchoke(Self_ref::atom()) -> ok.
+unchoke(Self_ref) ->
+    gen_statem:cast(Self_ref, unchoke).
 
--spec feed(ID::reference(), Queue::list()) -> ok.
-feed(ID, Queue) when is_list(Queue) ->
-    gen_statem:cast(ID, {feed, Queue}).
+-spec feed(Self_ref::atom(), Queue::list()) -> ok.
+feed(Self_ref, Queue) when is_list(Queue) ->
+    lager:warning("feeding", []),
+    gen_statem:cast(Self_ref, {feed, Queue}).
 
--spec start_link(ID::reference()) -> {ok, pid()} | ignore | {error, term()}.
-start_link(ID) ->
-    gen_statem:start_link({local, ID}, ?MODULE, [], []).
+-spec start_link(Self_ref::atom(),
+                 Peer_ref::reference()) -> {ok, pid()} | ignore | {error, term()}.
+start_link(Self_ref, Peer_ref) ->
+    gen_statem:start_link({local, Self_ref}, ?MODULE, [Peer_ref], []).
 
--spec stop(ID::reference()) -> ok.
-stop(ID) ->
-    gen_statem:cast(ID, stop).
+-spec stop(Self_ref::atom()) -> ok.
+stop(Self_ref) ->
+    gen_statem:cast(Self_ref, stop).
 
 dispatch([]) ->
     ok;
-dispatch([{Socket, Request}| Rest]) ->
-    io:format("~p: dispatching '~p'~n", [?FUNCTION_NAME, Request]),
+dispatch([{Create_request, Socket, Request_details}| Rest]) ->
+    lager:warning("~p: dispatching '~p'~n", [?FUNCTION_NAME, Request_details]),
+
+    Request = Create_request(Request_details),
     case gen_tcp:send(Socket, Request) of
         ok ->
             dispatch(Rest);
         {error, Reason} ->
-            lager:warning("~p: ~p: failed to send '~p' '~p', reason '~p'",
+            lager:warning("~p: ~p: failed to send '~p', reason '~p'",
                           [?MODULE, ?FUNCTION_NAME, Request, Reason]),
             error
     end.
@@ -76,14 +81,25 @@ dispatch([{Socket, Request}| Rest]) ->
 %%% Behaviour callback functions
 
 -spec init(Args::list()) -> {ok, idle, data()}.
-init(_Args) ->
+init([Peer_ref]) ->
     State = idle,
-    Data = #data{queue = []},
+    Data = #data{queue = [],
+                 peer_ref = Peer_ref},
     {ok, State, Data}.
 
-terminate(_Reason, _State, _Data) ->
+terminate(Reason, State, Data) ->
     % TODO return the remaining queue, if there is one, when terminating
-    normal.
+    lager:warning("reason '~p'~nstate '~p'~ndata '~p'~npeer_ref '~p'",
+                [Reason, State, Data, Data#data.peer_ref]),
+    case Data#data.peer_ref == terminated of
+        false ->
+            lager:error("SENDING TO PEER '~p'", [Data#data.peer_ref]),
+            ?PEER_W:statem_terminated(Data#data.peer_ref);
+        true ->
+            ok
+    end,
+
+    ok.
 
 callback_mode() ->
     state_functions.
@@ -120,9 +136,13 @@ run(cast, unchoke, Data) ->
 
     case Data#data.queue == [] of
         false ->
-            ok = dispatch(Data#data.queue),
-            ?PEER_W:request_blocks(self()),
-            {keep_state, #data{queue = []}};
+            case dispatch(Data#data.queue) of
+                ok ->
+                    ?PEER_W:request_blocks(Data#data.peer_ref),
+                    {keep_state, #data{queue = []}};
+                error ->
+                    {stop, normal, Data}
+            end;
         true ->
             {keep_state, Data}
     end;
@@ -140,6 +160,15 @@ run(Event_type, Event_content, Data) ->
     handle_event(Event_type, Event_content, Data).
 
 %%% State common events
+
+handle_event(info, peer_w_terminate, Data) ->
+    lager:debug("~p: ~p: stop due to peer_w", [?MODULE, ?FUNCTION_NAME]),
+
+    New_data = Data#data{peer_ref = terminated},
+
+    lager:error("~p: PEER TERMINATE '~p'", [?FUNCTION_NAME, New_data]),
+
+    {stop, normal, New_data};
 
 handle_event(cast, stop, Data) ->
     lager:debug("~p: ~p: stop", [?MODULE, ?FUNCTION_NAME]),

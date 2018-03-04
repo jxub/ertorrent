@@ -123,7 +123,7 @@ deactivate(Torrent_w_id) ->
     gen_server:cast(Torrent_w_id, {deactivate}).
 
 get_bitfield(Torrent_w_id) ->
-    gen_server:call(Torrent_w_id, {get_bitfield}).
+    gen_server:call(Torrent_w_id, get_bitfield).
 
 get_block_length(Torrent_w_id) ->
     gen_server:call(Torrent_w_id, {get_block_length}).
@@ -196,7 +196,7 @@ tracker_announce_loop(State) ->
             Response
     end,
 
-    lager:warning("~p: ref '~p'", [?FUNCTION_NAME, self()]),
+    lager:debug("~p: ref '~p'", [?FUNCTION_NAME, self()]),
 
     case ?METAINFO:get_value(<<"interval">>, Response) of
         {ok, Interval} ->
@@ -239,11 +239,20 @@ start_torrent(State) ->
     {ok, New_state}.
 
 update_rx_pieces(Own_bitfield, []) when is_list(Own_bitfield) ->
+    lager:debug("[~p]: ~p: ~p: bitfield '~p'", [self(), ?MODULE, ?FUNCTION_NAME, Own_bitfield]),
     ?ALGO:rx_init(Own_bitfield);
 update_rx_pieces(Own_bitfield, Peer_bitfields) when
       is_list(Own_bitfield) andalso
       is_list(Peer_bitfields) ->
-    ?ALGO:rx_update(Own_bitfield, Peer_bitfields).
+    lager:debug("[~p]: ~p: ~p: bitfield '~p', peer bf '~p'",
+                [self(), ?MODULE, ?FUNCTION_NAME, Own_bitfield, Peer_bitfields]),
+
+    % Filter peer's id from the tuple list Peer_bitfields
+    Bitfields_alone = [Bitfield || {_Peers_id, Bitfield} <- Peer_bitfields],
+
+    lager:warning("BITFIELD '~p'", [Bitfields_alone]),
+
+    ?ALGO:rx_update(Own_bitfield, Bitfields_alone).
 
 %%% Callback functions
 % TODO:
@@ -274,7 +283,6 @@ init([Metainfo, Start_when_ready]) ->
     % TODO check if the calculated length match the one in the meta info
     Length = length(Piece_hashes) * Piece_length,
 
-    % URI encoded peer id
     {block_length, Block_length} = ?SETTINGS_SRV:get_sync(block_length),
     {download_location, Location} = ?SETTINGS_SRV:get_sync(download_location),
     {peer_id, Peer_id} = ?SETTINGS_SRV:get_sync(peer_id),
@@ -354,7 +362,7 @@ terminate(Reason, _State) ->
 
 %% Synchronous
 
-handle_call({get_bitfield}, _From, State) ->
+handle_call(get_bitfield, _From, State) ->
     {reply, State#state.bitfield, State, hibernate};
 
 handle_call({get_block_length}, _From, State) ->
@@ -546,7 +554,7 @@ handle_info({tracker_announce, Response}, State) ->
 % information or 'error'.
 % @end
 handle_info({peer_s_rx_peer, Peer}, State) ->
-    lager:info("~p: ~p: peer_s_rx_peer '~p'", [?MODULE, ?FUNCTION_NAME, Peer]),
+    lager:debug("~p: ~p: peer_s_rx_peer '~p'", [?MODULE, ?FUNCTION_NAME, Peer]),
     {noreply, State, hibernate};
 % @doc Response from the peer server after trying to establish multiple peer
 % connections for multiple receiving peer workers. The response should not
@@ -554,7 +562,7 @@ handle_info({peer_s_rx_peer, Peer}, State) ->
 % workers failed to connect to its peer.
 % @end
 handle_info({peer_s_rx_peers, Peers}, State) ->
-    lager:info("~p: ~p: peer_s_rx_peers '~p'", [?MODULE, ?FUNCTION_NAME, Peers]),
+    lager:debug("~p: ~p: peer_s_rx_peers '~p'", [?MODULE, ?FUNCTION_NAME, Peers]),
     {noreply, State, hibernate};
 
 % @doc A peer worker received a peers bitfield. Store it for the piece
@@ -563,6 +571,8 @@ handle_info({peer_s_rx_peers, Peers}, State) ->
 % @end
 handle_info({peer_w_rx_bitfield, ID, Bitfield}, State) ->
     {ok, Bitfield_list} = ?BINARY:bitfield_to_list(State#state.bitfield),
+
+    lager:warning("~p: bitfield '~p'", [?FUNCTION_NAME, Bitfield_list]),
 
     New_bitfields = [{ID, Bitfield}| State#state.bitfields],
 
@@ -657,7 +667,7 @@ handle_info({hash_s_hash_files_res, {_Job_ID, Hashes}}, State) ->
     % Construct a list of the to list in the form [{X_hash, Y_hash}, {X_hash1,
     % Y_hash1}]. Now the comparison can be done in one iteration of the ziped
     % list.
-    Ziped_piece_hashes = lists:zip(State#state.pieces, Hashes),
+    Zipped_piece_hashes = lists:zip(State#state.pieces, Hashes),
 
     % Constuct a new list over missing and completed pieces.
     % 0 represents a missing piece.
@@ -669,10 +679,11 @@ handle_info({hash_s_hash_files_res, {_Job_ID, Hashes}}, State) ->
                                         false -> R = 0
                                     end,
                                     [R| Acc]
-                                end, [], Ziped_piece_hashes),
+                                end, [], Zipped_piece_hashes),
 
     % Reverse to regain correct order
     Bitfield_list_ordered = lists:reverse(Bitfield_list),
+    lager:warning("~p: bitfield '~p'", [?FUNCTION_NAME, Bitfield_list_ordered]),
     % TODO calculate new #state.left amount of 1s in the bitfield times piece_length
 
     % Convert list to bitfield

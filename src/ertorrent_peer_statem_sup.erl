@@ -3,7 +3,7 @@
 -behaviour(supervisor).
 
 -export([
-         start_child/1
+         start_child/2
         ]).
 
 -export([
@@ -11,9 +11,9 @@
          init/1
         ]).
 
-start_child(ID) ->
+start_child(Statem_ref, Peer_ref) ->
     lager:debug("~p: ~p", [?MODULE, ?FUNCTION_NAME]),
-    supervisor:start_child(?MODULE, [ID]).
+    supervisor:start_child(?MODULE, [Statem_ref, Peer_ref]).
 
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).

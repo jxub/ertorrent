@@ -10,11 +10,13 @@
     sasl,
     inets,
     os_mon,
+    % upstream
+    gproc,
     % hackey deps
     crypto,
     public_key,
     ssl,
-    % upstream
+    % end hackney deps
     lager, % want the logging to start up first
     hackney,
     cowboy

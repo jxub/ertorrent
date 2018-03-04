@@ -3,6 +3,7 @@
 -export([
          index_list/1,
          block_offsets/2,
+         gen_id/0,
          create_file_mapping/2,
          read_term_from_file/1,
          write_term_to_file/2,
@@ -14,6 +15,11 @@
 -ifdef(EUNIT).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
+
+gen_id() ->
+    ID_int = erlang:unique_integer(),
+    ID_str = integer_to_list(ID_int),
+    list_to_atom(ID_str).
 
 %ensure_file_entries({files, multiple, Name, Files}, Location) ->
 %    Dir = Location ++ '/' ++ Name,
@@ -248,6 +254,7 @@ hash_digest_to_string(Info_bencoded) ->
 
 % Splitting the pieces section from the metainfo into 20-byte segments and
 % placing them into a list.
+% TODO rename to split_metainfo_pieces
 pieces_binary_to_list(Binary_pieces) when is_bitstring(Binary_pieces) ->
     Pieces = pieces_binary_to_list1(Binary_pieces, []),
 

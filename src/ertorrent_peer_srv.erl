@@ -35,6 +35,7 @@
 -define(PEER_W, ertorrent_peer_worker).
 -define(TORRENT_SRV, ertorrent_torrent_srv).
 -define(TORRENT_W, ertorrent_torrent_worker).
+-define(UTILS, ertorrent_utils).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -81,19 +82,26 @@ stop() ->
 %%% Internal functions
 start_rx_peer(Torrent_pid, Block_length, Info_hash, Peer_id, Piece_length,
               {Address, Port}) when is_binary(Info_hash) ->
-    Statem_ref = make_ref(),
-    Statem_ret = ?PEER_STATEM_SUP:start_child(Statem_ref),
+    Statem_ref = ?UTILS:gen_id(),
+    Worker_ref = ?UTILS:gen_id(),
+
+    case Statem_ref == undefined of
+        true ->
+            lager:error("~p: GEN ID BROKEN '~p'", [?FUNCTION_NAME, Statem_ref, Worker_ref]);
+        false ->
+            ok
+    end,
+
+    Statem_ret = ?PEER_STATEM_SUP:start_child(Statem_ref, Worker_ref),
 
     Statem_res = case Statem_ret of
-        {ok, _Statem_pid} ->
-            Statem_ref;
+        {ok, Statem_pid} ->
+            Statem_pid;
         {error, Reason_statem} ->
             lager:error("~p:~p: failed to spawn peer_statem: '~p'",
                         [?MODULE, ?FUNCTION_NAME, Reason_statem]),
             error
     end,
-
-    Worker_ref = make_ref(),
 
     case Statem_res /= error andalso
          ?PEER_SUP:start_child(Worker_ref, Block_length, rx, Info_hash,
@@ -116,7 +124,8 @@ start_rx_peer(Torrent_pid, Block_length, Info_hash, Peer_id, Piece_length,
             lager:error("peer_srv failed to spawn a peer_worker (rx), check the peer_sup. reason: '~p'",
                         [Reason_sup]),
 
-            error
+            error;
+        Catch -> lager:error("UNHANDLED CLAUSE '~p'", [Catch])
     end.
 
 %%% Callback module

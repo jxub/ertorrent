@@ -42,14 +42,11 @@ rx_update(Own_bitfield, Peer_bitfields) when
       length(Own_bitfield) > 0 andalso
       is_list(Peer_bitfields) andalso
       length(Peer_bitfields) > 0 ->
-    lager:debug("~p: ~p: peer bitfields '~p'", [?MODULE, ?FUNCTION_NAME, Peer_bitfields]),
-    lager:debug("~p: ~p: own bitfield '~p'", [?MODULE, ?FUNCTION_NAME, Own_bitfield]),
-
-    % Filter peer's id from the tuple list Peer_bitfields
-    Bitfields_alone = [Bitfield || {_Peers_id, Bitfield} <- Peer_bitfields],
+    lager:debug("~p: ~p: own bitfield '~p'~npeer bitfields '~p'",
+                [?MODULE, ?FUNCTION_NAME, Own_bitfield, Peer_bitfields]),
 
     % Compile all the bitfields into one list to visualize the rarest pieces
-    {ok, Bitfields_sum} = ?BINARY:sum_bitfields(Bitfields_alone),
+    {ok, Bitfields_sum} = ?BINARY:sum_bitfields(Peer_bitfields),
 
     % Add indices to the bitfield summary to keep track of the sum for each
     % index before sorting.
